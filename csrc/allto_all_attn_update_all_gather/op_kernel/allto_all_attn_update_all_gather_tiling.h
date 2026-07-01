@@ -42,8 +42,8 @@ public:
 
     // ===== Peermem slot layout =====
     uint32_t slotCRowsMax;             // = totalT / groupSize
-    uint64_t slotABytesPerRank;        // = totalT       · rowSize
-    uint64_t slotCBytesPerRank;        // = slotCRowsMax · rowSize
+    uint64_t slotABytesPerRank;        // = totalT       · rowSize        (fused [attn||lse])
+    uint64_t slotCBytesPerRank;        // = slotCRowsMax · attnRowSize   (pure attn, lse_out dropped)
     uint64_t slotAOffsetInWin;         // = 0
     uint64_t slotCOffsetInWin;         // = groupSize · slotABytesPerRank
 

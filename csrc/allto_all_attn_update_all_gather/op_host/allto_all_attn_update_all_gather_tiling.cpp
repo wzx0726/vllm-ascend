@@ -204,10 +204,12 @@ static ge::graphStatus AlltoAllAttnUpdateAllGatherTilingFunc(gert::TilingContext
 
     // ---------- 4. Peermem slot 布局 ----------
     // slot A: cp 个 rank 区段，每段 totalT 行（按 mask_num 上界 b0_total ≤ totalT 预留）
+    //         slotA 行 = fused [attn || lse] (Phase A 仍交换 lse 给 Phase B 加权) → stride = rowSize
     // slot C: cp 个 rank 区段，每段 totalT/cp 行（head-AllGather 后每 rank 仅持自己的子表）
+    //         slotC 行 = 纯 attn (lse_out 已去除, 下游不消费) → stride = attnRowSize
     tilingData->slotCRowsMax        = totalT / groupSize;
     tilingData->slotABytesPerRank   = (uint64_t)totalT * tilingData->rowSize;
-    tilingData->slotCBytesPerRank   = (uint64_t)tilingData->slotCRowsMax * tilingData->rowSize;
+    tilingData->slotCBytesPerRank   = (uint64_t)tilingData->slotCRowsMax * tilingData->attnRowSize;
     tilingData->slotAOffsetInWin    = 0ULL;
     tilingData->slotCOffsetInWin    = (uint64_t)groupSize * tilingData->slotABytesPerRank;
 

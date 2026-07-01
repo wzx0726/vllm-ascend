@@ -4,22 +4,25 @@
  * AlltoAllAttnUpdateAllGather Kernel
  *
  * Per-token block-transpose AlltoAll (Phase A) → cross-cp LSE-weighted reduce
- * (Phase B) → head-AllGather + permute (Phase C). Inplace: attn_ref / lse_ref
- * share GM in-out. Active rows [0, b0_total) follow A→B→C; inactive rows
+ * (Phase B) → head-AllGather + permute (Phase C). Inplace: attn_ref shares GM
+ * in-out; lse is a pure input (read for weighting, no lse output — downstream
+ * does not consume it). Active rows [0, b0_total) follow A→B→C; inactive rows
  * [b0_total, totalT) are left untouched (pass-through).
  *
  * Phase A routing: row r → target rank = r % cp_size_, via peermem windows.
  *   b0_total = mask_num × cp_size_  (per-rank, b0 % cp == 0).
+ *   slotA row = fused [attn || lse] (Phase A still exchanges lse for Phase B).
+ *   slotC row = pure attn (lse_out dropped, no lse in slotC).
  *
  * Phase B per-token math:
  *   M1 read cp peers' slotA into UB, BF16→FP32 cast (CAST_NONE)
  *   M2 ProcessLseInfReplacement +Inf → -Inf, then ReduceMax → lse_m
  *   M3 lse_exp = exp(lse_p - lse_m)
  *   M4 sum_w = Σ lse_exp
- *   M5 lse_out = lse_m + log(sum_w)
+ *   M5 lse_out = lse_m + log(sum_w)        [pure intermediate, NOT written to GM]
  *   M6 norm_w = exp(lse_p - lse_out)
  *   M7 per LSE lane: load cp peers' dHead BF16 slice, cast FP32, weight, sum
- *   M8 Cast<CAST_RINT> BF16 → write slotC (peermem self window)
+ *   M8 Cast<CAST_RINT> BF16 → write slotC (peermem self window, attn only)
  *
  * Launcher: block_dim = min(aivNum, max(cp_size_, slotCRowsMax)) (batch-tailored,
  * no KERNEL_TASK_TYPE_DEFAULT). Idle cores' for-loops trivially skip but still
@@ -75,7 +78,7 @@ public:
 
     __aicore__ inline void Init(
         GM_ADDR attnIn, GM_ADDR lseIn, GM_ADDR maskNum,
-        GM_ADDR attnOut, GM_ADDR lseOut,
+        GM_ADDR attnOut,
         const TilingT* tiling, GM_ADDR contextGM)
     {
         // ---- Shape / row layout (v2 共有字段) ----
@@ -101,12 +104,13 @@ public:
         blockIdx_ = GetBlockIdx();
         // Default launcher → blockIdx_ ∈ [0, aivNum_). SplitCoreCal divides work.
 
-        // Inplace contract
+        // Inplace contract: attn_in == attn_out (SetRef-guaranteed). lse is now a
+        // pure input (no SetRef) — Phase B still reads it for weighting, but no
+        // lse output is written (lse_out dropped: downstream does not consume it).
         attnInGm_   = reinterpret_cast<__gm__ bfloat16_t*>(attnIn);
         lseInGm_    = reinterpret_cast<__gm__ float*>(lseIn);
         maskNumGm_  = reinterpret_cast<__gm__ int32_t*>(maskNum);
         attnOutGm_  = reinterpret_cast<__gm__ bfloat16_t*>(attnOut);   // == attnInGm_
-        lseOutGm_   = reinterpret_cast<__gm__ float*>(lseOut);          // == lseInGm_
 
         // Peermem window addresses — populated for all peers (cp_size_ ≤ 32 → buff_[32] enough).
         winContext_ = (__gm__ HcclOpResParam *)contextGM;
@@ -464,7 +468,8 @@ private:
         const uint32_t dHead = hDim_ / lseDim_;
         const uint32_t blockElems = PHASE_B_LANE_BLOCK * dHead;
         GM_ADDR slotC = buff_[rankId_] + slotCOffsetInWin_ + GetSlotCBytes(rankId_);
-        int64_t dstAttnOff = (int64_t)t * (int64_t)rowSize_;
+        // slotC row is pure attn now (lse_out dropped) — stride = attnRowSize_, not rowSize_.
+        int64_t dstAttnOff = (int64_t)t * (int64_t)attnRowSize_;
         int64_t localOutRow = (int64_t)t * (int64_t)cp_size_ + (int64_t)rankId_;
 
         for (uint32_t laneStart = 0; laneStart < lseDim_; laneStart += PHASE_B_LANE_BLOCK) {
@@ -534,23 +539,8 @@ private:
             SetFlag<HardEvent::MTE3_V>(EV_B_MTE3_V);
             WaitFlag<HardEvent::MTE3_V>(EV_B_MTE3_V);
         }
-
-        // write full LSE line once
-        SetFlag<HardEvent::V_MTE3>(EV_B_V_MTE3);
-        WaitFlag<HardEvent::V_MTE3>(EV_B_V_MTE3);
-        int64_t dstLseOff = dstAttnOff + (int64_t)attnRowSize_;
-        GlobalTensor<float> dstLse;
-        dstLse.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(slotC + dstLseOff));
-        DataCopyExtParams wrParam{1U, lseLineBytes_, 0U, 0U, 0U};
-        DataCopyPad(dstLse, ubLseOut, wrParam);
-        SetFlag<HardEvent::MTE3_V>(EV_B_MTE3_V);
-        WaitFlag<HardEvent::MTE3_V>(EV_B_MTE3_V);
-
-        GlobalTensor<float> dstLocalLse;
-        dstLocalLse.SetGlobalBuffer(lseOutGm_ + localOutRow * (int64_t)lseDim_);
-        DataCopyPad(dstLocalLse, ubLseOut, wrParam);
-        SetFlag<HardEvent::MTE3_V>(EV_B_MTE3_V);
-        WaitFlag<HardEvent::MTE3_V>(EV_B_MTE3_V);
+        // lse_out no longer written: ubLseOut is a pure intermediate (used by M7
+        // norm_w computation above). slotC row is pure attn; no lse GM writeback.
     }
 
     // ====================================================================
@@ -564,10 +554,10 @@ private:
     //  (line 531 改为 buff_[rankId_] + slotCOffsetInWin_ + GetSlotCBytes(rankId_),
     //   GetSlotCBytes 不再含 slotCOffsetInWin_,与 GetSlotABytes 风格一致).
     //  Phase C 反向:本 rank 从 buff_[srcRank] + slotCOffsetInWin_ + GetSlotCBytes(srcRank)
-    //  拉走 srcRank 算好的 b0_raw_ 行 fused [attn||lse],按 row=t·cp+srcRank 散到本 rank
-    //  attnOutGm_/lseOutGm_。srcRank == rankId_ 已由 PhaseB 直写最终输出,这里跳过。
+    //  拉走 srcRank 算好的 b0_raw_ 行纯 attn (lse_out dropped, slotC row = attnRowSize_),
+    //  按 row=t·cp+srcRank 散到本 rank attnOutGm_。srcRank == rankId_ 已由 PhaseB 直写最终输出,这里跳过。
     //
-    //  inplace 安全 (attnOutGm_ == attnInGm_, lseOutGm_ == lseInGm_):
+    //  inplace 安全 (attnOutGm_ == attnInGm_):
     //  Phase A barrier 之后 user GM 无人再读 (Phase B/C 都从 peermem 读),
     //  Phase C 的 cp-strided UB→GM 写覆盖 user GM 不与任何前序读冲突。
     // ====================================================================
@@ -595,11 +585,12 @@ private:
         if (tileB0 == 0) return;
 
         // slot = srcRank 窗口里 "srcRank 自己的 slotC 段" (PhaseB 把 M12 写在那).
+        // slotC row is pure attn (lse_out dropped) — read curRows·attnRowSize_ per pass.
         GM_ADDR  slot          = buff_[srcRank] + slotCOffsetInWin_ + GetSlotCBytes(srcRank);
         uint32_t attnDstStride = (cp_size_ - 1) * hAttnBytes_;       // GM bytes (skip non-self rows)
-        uint32_t lseDstStride  = (cp_size_ - 1) * lseLineBytes_;
-        uint16_t attnSrcStrideBlk = (uint16_t)(lseRowSize_ / 32);    // UB blocks (skip lse half)
-        uint16_t lseSrcStrideBlk  = (uint16_t)(attnRowSize_ / 32);   // UB blocks (skip attn half)
+        // attnSrcStrideBlk = 0: slotC row has no lse tail, so UB rows are contiguous
+        // (each row = attnRowSize_ = AlignUp32(hAttnBytes_), already 32B-padded to row boundary).
+        uint16_t attnSrcStrideBlk = 0;
         // 目的行起点 = tileStart 个 BLOCK × cp + srcRank,镜像 PhaseAPack srcRowBase.
         int64_t  dstRowBase    = (int64_t)tileStart * cp_size_ + srcRank;
 
@@ -620,18 +611,18 @@ private:
 
             WaitFlag<HardEvent::MTE3_MTE2>(ev);
 
-            // (1) GM→UB: single SDMA read curRows·rowSize_ as uint8 from peer slotC
-            int64_t srcOff = (int64_t)(tileStart + rowDone) * rowSize_;
+            // (1) GM→UB: single SDMA read curRows·attnRowSize_ as uint8 from peer slotC
+            int64_t srcOff = (int64_t)(tileStart + rowDone) * attnRowSize_;
             GlobalTensor<uint8_t> srcFused;
             srcFused.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(slot + srcOff));
-            DataCopyExtParams rdParam{(uint16_t)curRows, rowSize_, 0, 0, 0};
+            DataCopyExtParams rdParam{(uint16_t)curRows, attnRowSize_, 0, 0, 0};
             DataCopyPadExtParams<uint8_t> padParam{false, 0, 0, 0};
             DataCopyPad(ubBufU8, srcFused, rdParam, padParam);
 
             SetFlag<HardEvent::MTE2_MTE3>(ev);
             WaitFlag<HardEvent::MTE2_MTE3>(ev);
 
-            // (2) attn: UB→GM, srcStride 跳过 lse 段, dst cp-strided 写
+            // (2) attn: UB→GM, srcStride=0 (no lse tail), dst cp-strided 写
             int64_t outRow = dstRowBase + rowDone * cp_size_;
             {
                 LocalTensor<bfloat16_t> ubAttn = ubBufU8.ReinterpretCast<bfloat16_t>();
@@ -641,16 +632,7 @@ private:
                     (uint16_t)curRows, hAttnBytes_, attnSrcStrideBlk, attnDstStride, 0};
                 DataCopyPad(dstAttn, ubAttn, wrAttn);
             }
-            // (3) lse: UB→GM 从 attnRowSize_ 偏移读, srcStride 跳过 attn 段, dst cp-strided 写
-            {
-                LocalTensor<float> ubLse =
-                    ubBufU8[attnRowSize_].ReinterpretCast<float>();
-                GlobalTensor<float> dstLse;
-                dstLse.SetGlobalBuffer(lseOutGm_ + outRow * (int64_t)lseDim_);
-                DataCopyExtParams wrLse{
-                    (uint16_t)curRows, lseLineBytes_, lseSrcStrideBlk, lseDstStride, 0};
-                DataCopyPad(dstLse, ubLse, wrLse);
-            }
+            // lse_out dropped — no lse UB→GM writeback.
 
             SetFlag<HardEvent::MTE3_MTE2>(ev);
 
@@ -771,11 +753,10 @@ private:
     TBuf<TPosition::VECCALC> copyBuf_;              // ping-pong (USED_UB_SIZE)
     TBuf<TPosition::VECCALC> flagBuf_;              // 64B (mask_num + flag I/O)
 
-    // Inplace: attnInGm_ == attnOutGm_, lseInGm_ == lseOutGm_.
+    // Inplace: attnInGm_ == attnOutGm_. lse is pure input (no lse_out).
     __gm__ bfloat16_t *attnInGm_{nullptr};
     __gm__ bfloat16_t *attnOutGm_{nullptr};
     __gm__ float      *lseInGm_{nullptr};
-    __gm__ float      *lseOutGm_{nullptr};
     __gm__ int32_t    *maskNumGm_{nullptr};
 
     // ---- Shape / row layout (v2 共有) ----

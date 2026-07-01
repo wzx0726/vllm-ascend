@@ -19,16 +19,17 @@
 #include <tuple>
 
 namespace vllm_ascend {
- 
-std::tuple<at::Tensor&, at::Tensor&> npu_allto_all_attn_update_all_gather(
+
+at::Tensor& npu_allto_all_attn_update_all_gather(
     at::Tensor &attn,
-    at::Tensor &lse,
+    const at::Tensor &lse,
     const at::Tensor &mask_num,
     c10::string_view group,
     int64_t group_size)
 {
-    // Inplace operator: attn and lse are both input and output.
-    // Returns refs (mirrors dispatch_ffn_combine) so the inplace outputs are
+    // Inplace operator: attn is both input and output; lse is a pure input
+    // (read for Phase B weighting, no lse output — downstream does not consume it).
+    // Returns attn ref (mirrors dispatch_ffn_combine) so the inplace output is
     // bound for Dynamo functionalization + npugraph_ex graph capture.
     std::string group_str(group);
     char *group_ptr = group_str.data();
@@ -37,8 +38,8 @@ std::tuple<at::Tensor&, at::Tensor&> npu_allto_all_attn_update_all_gather(
         attn, lse, mask_num,
         group_ptr, group_size);
 
-    return {attn, lse};
+    return attn;
 }
- 
+
 }
 #endif

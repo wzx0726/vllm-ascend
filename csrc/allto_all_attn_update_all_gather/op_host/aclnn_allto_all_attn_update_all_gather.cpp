@@ -4,9 +4,10 @@
  * AlltoAllAttnUpdateAllGather ACLNN Two-Stage Interface Implementation
  *
  * Inplace: outer API takes 3 tensors (attn / lse / mask_num); the OpDef _ref
- * rename makes opbuild emit NnopbaseSetRef, so the inner API drops the duplicate
- * Output params — each tensor is passed ONCE. The kernel entry receives 5 GM_ADDR
- * with attn==attn_out and lse==lse_out guaranteed by SetRef.
+ * rename on attn_ref makes opbuild emit NnopbaseSetRef for attn, so the inner
+ * API drops the duplicate attn Output param — attn is passed ONCE. lse is a
+ * pure input (no SetRef, no lse output). The kernel entry receives 4 GM_ADDR
+ * (attn_in, lse_in, mask_num, attn_out) with attn_in == attn_out by SetRef.
  *
  * NnopbaseSetHcclServerType(executor, MTE) is called before inner-execute: this
  * is a peermem-only MC2 operator (kernel drives SDMA via winContext_->localWindowsIn
@@ -47,8 +48,9 @@ enum NnopbaseHcclServerType {
     NNOPBASE_HCCL_SERVER_TYPE_END
 };
 
-// Inner implementation auto-generated from OpDef. The _ref inplace rename makes
-// opbuild emit NnopbaseSetRef, so the inner API drops the Output params.
+// Inner implementation auto-generated from OpDef. The _ref inplace rename on
+// attn_ref makes opbuild emit NnopbaseSetRef for attn, so the inner API drops
+// the attn Output param. lse is a pure input (no Output, no SetRef).
 extern aclnnStatus aclnnInnerAlltoAllAttnUpdateAllGatherGetWorkspaceSize(
     const aclTensor *attn_ref, const aclTensor *lse_ref, const aclTensor *mask_num,
     char *group, int64_t group_size,
@@ -186,8 +188,8 @@ aclnnStatus aclnnAlltoAllAttnUpdateAllGatherGetWorkspaceSize(
     OP_LOGD("AlltoAllAttnUpdateAllGather inplace, attn %s, lse %s, group_size=%ld",
             attn->ToString().GetString(), lse->ToString().GetString(), group_size);
 
-    // Inplace via OpDef SetRef: pass attn / lse ONCE. Framework binds
-    // Output("attn_ref") slot to Input("attn_ref") same address (likewise lse).
+    // Inplace via OpDef SetRef: pass attn ONCE (lse is a pure input, no SetRef).
+    // Framework binds Output("attn_ref") slot to Input("attn_ref") same address.
     aclnnStatus ret = aclnnInnerAlltoAllAttnUpdateAllGatherGetWorkspaceSize(
         attn, lse, mask_num, group, group_size,
         workspaceSize, executor);

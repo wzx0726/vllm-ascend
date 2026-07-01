@@ -7,11 +7,13 @@
  * _ref suffix → opbuild emits NnopbaseSetRef → framework binds Output GM to
  * Input GM at executor build time.
  *   attn_in / attn_out → SAME GM address (SetRef-guaranteed)
- *   lse_in  / lse_out  → SAME GM address (SetRef-guaranteed)
- * Inner API generated from OpDef passes only 3 input tensors; kernel entry
- * still receives 5 GM_ADDR (3 inputs + 2 outputs) but the two pairs point to
- * identical addresses. mask_num is a 0-d int32 device tensor — kernel reads
- * it at runtime via DataCopyPad (aclgraph-compatible).
+ *   lse_in             → pure input (no SetRef, no lse output — dropped: the
+ *                        fused op only needs lse for Phase B weighting, not as
+ *                        an output; downstream does not consume it).
+ * Inner API generated from OpDef passes 3 tensors (attn inplace, lse input,
+ * mask_num); kernel entry receives 4 GM_ADDR (attn_in, lse_in, mask_num,
+ * attn_out — attn_in == attn_out). mask_num is a 0-d int32 device tensor —
+ * kernel reads it at runtime via DataCopyPad (aclgraph-compatible).
  *
  * Launcher: default (NO KERNEL_TASK_TYPE_DEFAULT). Host SetBlockDim =
  * min(aivNum, max(cp_size_, slotCRowsMax)). SplitCoreCalFor{Rank,Token}
@@ -27,7 +29,7 @@ using namespace AscendC;
 
 extern "C" __global__ __aicore__ void allto_all_attn_update_all_gather(
     GM_ADDR attn_in, GM_ADDR lse_in, GM_ADDR mask_num,
-    GM_ADDR attn_out, GM_ADDR lse_out,                  // SetRef: == attn_in / lse_in
+    GM_ADDR attn_out,                                      // SetRef: == attn_in
     GM_ADDR workspace, GM_ADDR tilingGM)
 {
     REGISTER_TILING_DEFAULT(Mc2Tiling::AlltoAllAttnUpdateAllGatherTilingData);
@@ -38,6 +40,6 @@ extern "C" __global__ __aicore__ void allto_all_attn_update_all_gather(
 
     AlltoAllAttnUpdateAllGather::KernelAlltoAllAttnUpdateAllGather<
         Mc2Tiling::AlltoAllAttnUpdateAllGatherTilingData> op(&pipe);
-    op.Init(attn_in, lse_in, mask_num, attn_out, lse_out, &tilingData, contextGM);
+    op.Init(attn_in, lse_in, mask_num, attn_out, &tilingData, contextGM);
     op.Process();
 }

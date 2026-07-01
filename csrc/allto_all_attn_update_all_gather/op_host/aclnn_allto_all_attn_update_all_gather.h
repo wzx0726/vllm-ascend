@@ -4,11 +4,13 @@
  * AlltoAllAttnUpdateAllGather ACLNN Two-Stage Interface Declaration
  *
  * In-place fused {alltoall + cross-cp LSE-weighted attn update + head-AllGather
- * + permute} for CP (context parallel). The OpDef _ref inplace rename makes
- * opbuild emit NnopbaseSetRef, so the inner API drops the duplicate Output params.
+ * + permute} for CP (context parallel). The OpDef _ref inplace rename (attn_ref
+ * only) makes opbuild emit NnopbaseSetRef for attn, so the inner API drops the
+ * duplicate attn Output param. lse is a pure input (no SetRef, no lse output —
+ * the fused op only needs lse for Phase B weighting, not as an output).
  *
  *   attn               : [T·cp, n/cp · D]  bf16   (Input & Output, same tensor)
- *   lse                : [T·cp, n/cp]      fp32   (Input & Output, same tensor)
+ *   lse                : [T·cp, n/cp]      fp32   (Input only — no output)
  *   mask_num           : []  int32  (0-d; per-rank active token count)
  *   group, group_size  : HCCL group descriptor (group_size = cp ∈ {1,2,4,8,16,32})
  *
