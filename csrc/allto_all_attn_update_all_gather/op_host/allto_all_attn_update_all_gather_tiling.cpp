@@ -173,7 +173,13 @@ static ge::graphStatus AlltoAllAttnUpdateAllGatherTilingFunc(gert::TilingContext
             tilingData->attnRowSize, tilingData->lseRowSize),
         return ge::GRAPH_FAILED);
 
-    // Phase B per-token reduce UB 容量校验 (LSE 全 lane + attn lane-streaming,见 kernel.h PhaseBReduce)
+    // Phase B per-token reduce UB capacity check (LSE full-lane + attn lane-streaming, see kernel.h PhaseBReduce)
+    // Rev 5.7: cp-dim batched streaming (k=cpBatchSize). UB footprint governed by k, always <= MAX_REDUCE_UB_BYTES.
+    //   k = max(1, min(cp, floor((MAX_REDUCE_UB_BYTES - fixedOverhead)/perPeerBytes)))
+    //   perPeerBytes   = blockElems*6 (ubInFp32*4 + ubAttnBf*2)
+    //   fixedOverhead  = LSE seg (spPadAlign*4*3 + lsePad*4*3 + spPadAlign)
+    //                   + attn seg (ubAccFp32*4 + ubBcTmp*4 + ubOutBf*2 = blockElems*10)
+    //   k=cp -> single batch (== old one-shot); k<cp -> multi-batch streaming sum.
     int64_t cp_int     = static_cast<int64_t>(groupSize);
     int64_t hDim_int   = static_cast<int64_t>(hDim);
     int64_t lseDim_int = static_cast<int64_t>(lseDim);
@@ -183,24 +189,34 @@ static ge::graphStatus AlltoAllAttnUpdateAllGatherTilingFunc(gert::TilingContext
     int64_t blockElems_int = laneBlock_int * dHead_int;
     int64_t spPad_int      = cp_int * lsePad_int;
     int64_t spPadAlign_int = ((spPad_int + 63) / 64) * 64;
-    int64_t reduceUbBytes =
-          cp_int * blockElems_int * 4                 // ubInFp32
-        + spPadAlign_int * 4                          // ubLseFp32
-        + spPadAlign_int * 4                          // ubLseExp
-        + lsePad_int * 4 * 3                          // ubLseM + ubLseSum + ubLseOut
-        + blockElems_int * 4                          // ubAccFp32
-        + spPadAlign_int * 4                          // ubNegInf
-        + spPadAlign_int                              // ubMaskU8
-        + cp_int * blockElems_int * 2                 // ubAttnBf
-        + blockElems_int * 2;                         // ubOutBf
+
+    const int64_t perPeerBytes     = blockElems_int * 6;        // ubInFp32*4 + ubAttnBf*2
+    const int64_t lseFixedOverhead = spPadAlign_int * 4 * 3     // ubLseFp32 + ubLseExp + ubNegInf
+                                   + lsePad_int * 4 * 3         // ubLseM + ubLseSum + ubLseOut
+                                   + spPadAlign_int;            // ubMaskU8
+    const int64_t attnFixedOverhead = blockElems_int * 4        // ubAccFp32
+                                    + blockElems_int * 4        // ubBcTmp (Rev 5.7: BroadCast scratch)
+                                    + blockElems_int * 2;       // ubOutBf
+    const int64_t fixedOverhead = lseFixedOverhead + attnFixedOverhead;
+
+    int64_t kMax = (MAX_REDUCE_UB_BYTES - fixedOverhead) / perPeerBytes;
+    if (kMax < 1) {
+        kMax = 1;
+    }
+    int64_t k = (cp_int < kMax) ? cp_int : kMax;                // k in [1, cp]
+    uint32_t cpBatchSize = static_cast<uint32_t>(k);
+
+    int64_t reduceUbBytes = k * perPeerBytes + fixedOverhead;
     OP_TILING_CHECK(reduceUbBytes > MAX_REDUCE_UB_BYTES,
         VECTOR_INNER_ERR_REPORT_TILING(context->GetNodeName(),
             "Phase B reduce UB bytes %ld > USED_UB_SIZE %ld "
-            "(cp=%ld, hDim=%ld, lseDim=%ld, lsePad=%ld, spPadAlign=%ld, dHead=%ld, laneBlock=%ld). "
-            "Reduce hDim, lseDim, laneBlock, or cp_size.",
-            reduceUbBytes, MAX_REDUCE_UB_BYTES, cp_int, hDim_int, lseDim_int,
+            "(cp=%ld, k(cpBatchSize)=%u, hDim=%ld, lseDim=%ld, lsePad=%ld, spPadAlign=%ld, dHead=%ld, laneBlock=%ld). "
+            "Internal error: k-adaptive formula should guarantee fit. Reduce hDim/lseDim/laneBlock.",
+            reduceUbBytes, MAX_REDUCE_UB_BYTES, cp_int, cpBatchSize, hDim_int, lseDim_int,
             lsePad_int, spPadAlign_int, dHead_int, laneBlock_int),
         return ge::GRAPH_FAILED);
+
+    tilingData->cpBatchSize = cpBatchSize;                      // Rev 5.7: Phase B cp streaming batch size
 
     // ---------- 4. Peermem slot 布局 ----------
     // slot A: cp 个 rank 区段，每段 totalT 行（按 mask_num 上界 b0_total ≤ totalT 预留）

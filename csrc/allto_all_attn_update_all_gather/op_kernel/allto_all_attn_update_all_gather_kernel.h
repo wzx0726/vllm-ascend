@@ -86,6 +86,7 @@ public:
         totalT_       = tiling->totalT;
         lseDim_       = tiling->lseDim;
         hDim_         = tiling->hDim;
+        cpBatchSize_  = tiling->cpBatchSize;   // Rev 5.7: Phase B cp 流式批大小
         hAttnBytes_   = tiling->attnLineBytes;
         lseLineBytes_ = tiling->lseLineBytes;
         attnRowSize_  = tiling->attnRowSize;
@@ -353,28 +354,32 @@ private:
         const uint32_t spPadAlign  = ((spPad + ELEM_PER_256B - 1) / ELEM_PER_256B) * ELEM_PER_256B;
         const uint32_t dHead       = hDim_ / lseDim_;
         const uint32_t blockElems  = PHASE_B_LANE_BLOCK * dHead;
-        const uint32_t peerElems   = cp_size_ * blockElems;
+        // Rev 5.7: cp-dim batched streaming, k=cpBatchSize_ peers per batch (not cp all-in).
+        const uint32_t batchElems  = cpBatchSize_ * blockElems;
 
-        // copyBuf_ (160 KB) byte-offset segmentation. 各段不重叠。
+        // copyBuf_ (160 KB) byte-offset segmentation. Segments do not overlap.
+        // Rev 5.7: ubInFp32/ubAttnBf use batchElems (k*blockElems); added ubBcTmp (BroadCast scratch,
+        //   since ubAccFp32 becomes cross-batch running sum, no longer reusable as BroadCast dst).
         LocalTensor<uint8_t> ubAll = copyBuf_.Get<uint8_t>();
         uint32_t off = 0;
 
-        LocalTensor<float>      ubInFp32  = ubAll[off].ReinterpretCast<float>();      off += peerElems * 4;
+        LocalTensor<float>      ubInFp32  = ubAll[off].ReinterpretCast<float>();      off += batchElems * 4;
         LocalTensor<float>      ubLseFp32 = ubAll[off].ReinterpretCast<float>();      off += spPadAlign * 4;
         LocalTensor<float>      ubLseExp  = ubAll[off].ReinterpretCast<float>();      off += spPadAlign * 4;
         LocalTensor<float>      ubLseM    = ubAll[off].ReinterpretCast<float>();      off += kPad * 4;
         LocalTensor<float>      ubLseSum  = ubAll[off].ReinterpretCast<float>();      off += kPad * 4;
         LocalTensor<float>      ubLseOut  = ubAll[off].ReinterpretCast<float>();      off += kPad * 4;
         LocalTensor<float>      ubAccFp32 = ubAll[off].ReinterpretCast<float>();      off += blockElems * 4;
+        LocalTensor<float>      ubBcTmp   = ubAll[off].ReinterpretCast<float>();      off += blockElems * 4;
         LocalTensor<float>      ubNegInf  = ubAll[off].ReinterpretCast<float>();      off += spPadAlign * 4;
         LocalTensor<uint8_t>    ubMaskU8  = ubAll[off];                               off += spPadAlign;
-        LocalTensor<bfloat16_t> ubAttnBf  = ubAll[off].ReinterpretCast<bfloat16_t>(); off += peerElems * 2;
+        LocalTensor<bfloat16_t> ubAttnBf  = ubAll[off].ReinterpretCast<bfloat16_t>(); off += batchElems * 2;
         LocalTensor<bfloat16_t> ubOutBf   = ubAll[off].ReinterpretCast<bfloat16_t>(); /* off += blockElems * 2 */
 
         for (uint32_t t = startTokenId_; t < endTokenId_; t++) {
             ReducePerToken(t, kPad, spPad, spPadAlign,
                 ubInFp32, ubLseFp32, ubLseExp,
-                ubLseM, ubLseSum, ubLseOut, ubAccFp32,
+                ubLseM, ubLseSum, ubLseOut, ubAccFp32, ubBcTmp,
                 ubNegInf, ubMaskU8, ubAttnBf, ubOutBf);
             PipeBarrier<PIPE_ALL>();
         }
@@ -390,6 +395,7 @@ private:
         LocalTensor<float>&      ubLseSum,
         LocalTensor<float>&      ubLseOut,
         LocalTensor<float>&      ubAccFp32,
+        LocalTensor<float>&      ubBcTmp,
         LocalTensor<float>&      ubNegInf,
         LocalTensor<uint8_t>&    ubMaskU8,
         LocalTensor<bfloat16_t>& ubAttnBf,
@@ -464,11 +470,19 @@ private:
         Exp(ubLseExp, ubLseExp, kPad * cp);
         PipeBarrier<PIPE_V>();
 
-        // ===== M8-M12: attn 按 LSE lane-block 流式 merge/write,避免 cp·hDim 全量 UB 常驻 =====
+        // ===== M8-M12: attn LSE lane-block streaming merge/write (avoid cp*hDim full UB resident) =====
+        // Rev 5.7: cp-dim batched streaming (k=cpBatchSize_), cross-batch running sum.
+        //   M1-M7 (LSE full, small) unchanged; M8-M12 attn accumulate -> cpBase step k batches:
+        //   each batch load/Cast/Mul kCur peers, Add into running sum (ubAccFp32);
+        //   cross-batch PipeBarrier<PIPE_ALL> ensures this batch V(Cast) finishes reading
+        //   ubAttnBf/ubInFp32 before next batch MTE2(load)/V(Cast) may overwrite.
+        //   Precision: accumulate order keeps peer ascending (cpBase+j), running sum 0-seed,
+        //   bit-identical to old one-shot (0+x==x in IEEE754, attn non-negative).
         const uint32_t dHead = hDim_ / lseDim_;
         const uint32_t blockElems = PHASE_B_LANE_BLOCK * dHead;
+        const int32_t k = (int32_t)cpBatchSize_;          // Rev 5.7: peers per batch
         GM_ADDR slotC = buff_[rankId_] + slotCOffsetInWin_ + GetSlotCBytes(rankId_);
-        // slotC row is pure attn now (lse_out dropped) — stride = attnRowSize_, not rowSize_.
+        // slotC row is pure attn now (lse_out dropped) - stride = attnRowSize_, not rowSize_.
         int64_t dstAttnOff = (int64_t)t * (int64_t)attnRowSize_;
         int64_t localOutRow = (int64_t)t * (int64_t)cp_size_ + (int64_t)rankId_;
 
@@ -477,41 +491,63 @@ private:
             laneCnt = (laneCnt > PHASE_B_LANE_BLOCK) ? PHASE_B_LANE_BLOCK : laneCnt;
             uint32_t laneElems = laneCnt * dHead;
 
-            // load cp peers' attn block: [laneStart*dHead, (laneStart+laneCnt)*dHead)
-            for (int32_t i = 0; i < cp; i++) {
-                int64_t rowOff = (int64_t)slotAOffsetInWin_
-                               + (int64_t)i * (int64_t)slotABytesPerRank_
-                               + (int64_t)t * (int64_t)rowSize_;
-                int64_t attnLaneOff = (int64_t)laneStart * (int64_t)dHead * (int64_t)sizeof(bfloat16_t);
-                GlobalTensor<bfloat16_t> srcAttn;
-                srcAttn.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(selfWin + rowOff + attnLaneOff));
-                DataCopyExtParams rdParam{1U, laneElems * (uint32_t)sizeof(bfloat16_t), 0U, 0U, 0U};
-                DataCopyPadExtParams<bfloat16_t> padParam{false, 0, 0, 0};
-                DataCopyPad(ubAttnBf[i * blockElems], srcAttn, rdParam, padParam);
-            }
-            SetFlag<HardEvent::MTE2_V>(EV_B_MTE2_V);
-            WaitFlag<HardEvent::MTE2_V>(EV_B_MTE2_V);
-
-            for (int32_t i = 0; i < cp; i++) {
-                Cast(ubInFp32[i * blockElems], ubAttnBf[i * blockElems], RoundMode::CAST_NONE, laneElems);
-            }
-            PipeBarrier<PIPE_V>();
-
+            // running sum: first peer initializes via DataCopy (bit-identical to old one-shot
+            // DataCopy[0]+Add[1..], incl. -0.0 sign - Duplicate(0)+Add(0+x) would flip -0.0 to
+            // +0.0). Subsequent peers Add into running sum (cross-batch preserved).
+            bool accInit = false;
             const uint32_t weightSrcShape[2] = {laneCnt, 1U};
             uint32_t weightDstShape[2] = {laneCnt, dHead};
-            for (int32_t i = 0; i < cp; i++) {
-                BroadCast<float, ALIGNED_TO_2, 1>(
-                    ubAccFp32, ubLseExp[i * kPad + laneStart], weightDstShape, weightSrcShape);
-                PipeBarrier<PIPE_V>();
-                Mul(ubInFp32[i * blockElems], ubInFp32[i * blockElems], ubAccFp32, laneElems);
-                PipeBarrier<PIPE_V>();
-            }
 
-            DataCopy(ubAccFp32, ubInFp32, laneElems);
-            PipeBarrier<PIPE_V>();
-            for (int32_t i = 1; i < cp; i++) {
-                Add(ubAccFp32, ubAccFp32, ubInFp32[i * blockElems], laneElems);
+            // cp-dim batched streaming: cpBase steps by k, kCur = min(k, cp - cpBase) peers per batch
+            for (int32_t cpBase = 0; cpBase < cp; cpBase += k) {
+                int32_t kCur = (cp - cpBase < k) ? (cp - cpBase) : k;
+
+                // load kCur peers' attn block: peer index i = cpBase + j
+                for (int32_t j = 0; j < kCur; j++) {
+                    int32_t i = cpBase + j;
+                    int64_t rowOff = (int64_t)slotAOffsetInWin_
+                                   + (int64_t)i * (int64_t)slotABytesPerRank_
+                                   + (int64_t)t * (int64_t)rowSize_;
+                    int64_t attnLaneOff = (int64_t)laneStart * (int64_t)dHead * (int64_t)sizeof(bfloat16_t);
+                    GlobalTensor<bfloat16_t> srcAttn;
+                    srcAttn.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(selfWin + rowOff + attnLaneOff));
+                    DataCopyExtParams rdParam{1U, laneElems * (uint32_t)sizeof(bfloat16_t), 0U, 0U, 0U};
+                    DataCopyPadExtParams<bfloat16_t> padParam{false, 0, 0, 0};
+                    DataCopyPad(ubAttnBf[j * blockElems], srcAttn, rdParam, padParam);
+                }
+                SetFlag<HardEvent::MTE2_V>(EV_B_MTE2_V);
+                WaitFlag<HardEvent::MTE2_V>(EV_B_MTE2_V);
+
+                for (int32_t j = 0; j < kCur; j++) {
+                    Cast(ubInFp32[j * blockElems], ubAttnBf[j * blockElems], RoundMode::CAST_NONE, laneElems);
+                }
                 PipeBarrier<PIPE_V>();
+
+                // norm_w = exp(lse - lseOut) already in ubLseExp; BroadCast to ubBcTmp, Mul into ubInFp32
+                for (int32_t j = 0; j < kCur; j++) {
+                    int32_t i = cpBase + j;
+                    BroadCast<float, ALIGNED_TO_2, 1>(
+                        ubBcTmp, ubLseExp[i * kPad + laneStart], weightDstShape, weightSrcShape);
+                    PipeBarrier<PIPE_V>();
+                    Mul(ubInFp32[j * blockElems], ubInFp32[j * blockElems], ubBcTmp, laneElems);
+                    PipeBarrier<PIPE_V>();
+                }
+
+                // accumulate into running sum. First peer: DataCopy init (== old DataCopy[0]);
+                // rest: Add. Order ubInFp32[0]+[1]+...+[cp-1] matches old one-shot bit-for-bit.
+                for (int32_t j = 0; j < kCur; j++) {
+                    if (!accInit) {
+                        DataCopy(ubAccFp32, ubInFp32[j * blockElems], laneElems);
+                        accInit = true;
+                    } else {
+                        Add(ubAccFp32, ubAccFp32, ubInFp32[j * blockElems], laneElems);
+                    }
+                    PipeBarrier<PIPE_V>();
+                }
+
+                // cross-batch barrier: this batch V(Cast) read of ubAttnBf/ubInFp32 done,
+                // next batch MTE2(load)/V(Cast) may overwrite them
+                PipeBarrier<PIPE_ALL>();
             }
 
             Cast(ubOutBf, ubAccFp32, RoundMode::CAST_RINT, laneElems);
@@ -768,6 +804,7 @@ private:
     uint32_t totalT_          = 0;
     uint32_t lseDim_          = 0;
     uint32_t hDim_            = 0;
+    uint32_t cpBatchSize_     = 0;   // Rev 5.7: Phase B cp 流式批大小(k)
     uint32_t hAttnBytes_      = 0;
     uint32_t lseLineBytes_    = 0;
     uint32_t attnRowSize_     = 0;

@@ -51,6 +51,13 @@ public:
     uint32_t maxRowsPerSubtile;        // single ping-pong half row 上界
     uint32_t numTiles;                 // 由 kernel runtime 根据 b0_total 派生
     uint32_t maxTileB0;                // 单 tile B0 上界
+
+    // ===== Phase B cp-streaming (Rev 5.7) =====
+    // attn cp-dim batched streaming; k peers per batch (k=cpBatchSize).
+    // host adaptive k = max(1, min(cp, floor((160KB - fixedOverhead)/(blockElems*6))))
+    //   keeps ubInFp32/ubAttnBf at k*blockElems (not cp*blockElems), UB <= 160KB.
+    // k=cp single-batch (== old one-shot); k<cp multi-batch streaming sum.
+    uint32_t cpBatchSize;              // Phase B per-batch cp count (Rev 5.7)
 };
 
 }  // namespace Mc2Tiling
