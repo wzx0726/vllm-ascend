@@ -27,11 +27,11 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata, CPChunkedContextMetadata
+from vllm_ascend.attention.context_parallel.common_cp import DCPChunkedContextMetadata
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
-    enable_cp,
+    enable_dcp,
     enabling_mlapo,
     maybe_save_kv_layer_to_connector,
     notify_kv_cache_written,
@@ -98,7 +98,7 @@ class AscendMLABackend(AttentionBackend):
                 return AscendMLAMetadataBuilder
             from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaCPMetadataBuilder
 
-            return AscendMlaCPMetadataBuilder
+            return AscendMlaDCPMetadataBuilder
         return AscendMLAMetadataBuilder
 
     @staticmethod
@@ -118,7 +118,7 @@ class AscendMLABackend(AttentionBackend):
                 return AscendMLAImpl
             from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaCPImpl
 
-            return AscendMlaCPImpl
+            return AscendMlaDCPImpl
         return AscendMLAImpl
 
     @staticmethod
@@ -157,10 +157,9 @@ class AscendMLAPrefillMetadata:
     block_table: torch.Tensor
     max_query_len: int
     max_seq_lens: int
-    chunked_context: ChunkedContextMetadata | CPChunkedContextMetadata | None = None
+    chunked_context: ChunkedContextMetadata | DCPChunkedContextMetadata | None = None
     sin: torch.Tensor = None
     cos: torch.Tensor = None
-    pcp_metadata: AscendPCPMetadata | None = None
     actual_seq_lengths_q: list[int] | None = None
 
 
@@ -198,7 +197,6 @@ class AscendMLAMetadata:
     # |-------------------- seq_len ---------------------|
     #                                   |-- query_len ---|
 
-    num_actual_tokens_pcp_padded: int
     num_actual_tokens: int  # Number of tokens excluding padding.
     slot_mapping: torch.Tensor
     query_start_loc: torch.Tensor
@@ -621,7 +619,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
     ) -> AscendMLAPrefillMetadata:
         query_start_loc = common_attn_metadata.query_start_loc
 
-        # NOTE: Currently, MTP-fullgraph is incompatibility pcp
+        # NOTE: MTP full graph is incompatible with context parallelism.
         input_positions = common_attn_metadata.positions[: self.num_actual_tokens].long()
 
         chunked_context_metadata = self.build_chunked_metadata(common_prefix_len, common_attn_metadata)
@@ -670,7 +668,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         block_table_size = self.get_block_table_size(common_attn_metadata, BUILD_METADATA_STEP_DECODE)
         self.block_table = self.block_table[:block_table_size]
 
-        # NOTE: Currently, MTP-fullgraph is incompatibility pcp
+        # NOTE: MTP full graph is incompatible with context parallelism.
         # NOTE: Maybe this block_table change can be removed when graph_pad_size > 1.
         if self.graph_pad_size > self.num_decodes and self.speculative_config.disable_padded_drafter_batch:
             self.block_table = self.block_table[: self.graph_pad_size, ...]
@@ -843,7 +841,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         num_tokens,
         vllm_config=None,
         speculative_config=None,
-        num_dcp_pcp_tokens=None,
+        num_dcp_tokens=None,
         draft_attn_metadatas=None,
     ):
         if _EXTRA_CTX.is_draft_model:
@@ -959,6 +957,20 @@ class AscendMLAImpl(MLAAttentionImpl):
         # Convert from (B, N, V) to (B, N * V)
         x = x.reshape(-1, self.num_heads * self.v_head_dim)
         return x
+
+    def _v_up_proj_batch_major(self, x: torch.Tensor) -> torch.Tensor:
+        """Project a batch-major partial-attention result.
+
+        The normal MLA kernel returns head-major output. Distributed attention
+        merges partial outputs into batch-major layout, so it only needs this
+        small layout adapter instead of replacing the projection itself.
+        """
+        x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
+        x = torch.bmm(x, self.W_UV)
+        return x.transpose(0, 1).reshape(
+            -1,
+            self.num_heads * self.v_head_dim,
+        )
 
     # Return `ql_nope`, `q_pe`
     def _q_proj_and_k_up_proj(self, x):
@@ -1177,7 +1189,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self,
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
-        chunked_context: CPChunkedContextMetadata,
+        chunked_context: DCPChunkedContextMetadata,
         chunk_idx: int,
         toks: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1678,6 +1690,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         cos = attn_metadata.decode.cos
         sin = attn_metadata.decode.sin
         decode_ql_nope, decode_q_pe = self._q_proj_and_k_up_proj(decode_q_c)
+        decode_ql_nope, decode_q_pe = self.reorg_decode_q(
+            decode_ql_nope,
+            decode_q_pe,
+        )
         decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
         dequant_scale_q_nope = None
         if self.fa_quant_layer and get_ascend_device_type() == AscendDeviceType.A5:
