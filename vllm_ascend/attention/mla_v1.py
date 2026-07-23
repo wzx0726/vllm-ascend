@@ -78,10 +78,18 @@ class AscendMLABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls():
-        if enable_dcp():
+        dcp_enabled = enable_dcp()
+        pcp_enabled = get_current_vllm_config().parallel_config.prefill_context_parallel_size > 1
+        if dcp_enabled and pcp_enabled:
+            raise NotImplementedError("Ascend MRV2 MLA does not support PCP and DCP simultaneously yet.")
+        if dcp_enabled:
             from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaDCPMetadataBuilder
 
             return AscendMlaDCPMetadataBuilder
+        if pcp_enabled:
+            from vllm_ascend.attention.context_parallel.mla_cp import AscendMLAPCPMetadataBuilder
+
+            return AscendMLAPCPMetadataBuilder
         return AscendMLAMetadataBuilder
 
     @staticmethod
@@ -96,10 +104,18 @@ class AscendMLABackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> type["MLAAttentionImpl"]:
-        if enable_dcp():
+        dcp_enabled = enable_dcp()
+        pcp_enabled = get_current_vllm_config().parallel_config.prefill_context_parallel_size > 1
+        if dcp_enabled and pcp_enabled:
+            raise NotImplementedError("Ascend MRV2 MLA does not support PCP and DCP simultaneously yet.")
+        if dcp_enabled:
             from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaDCPImpl
 
             return AscendMlaDCPImpl
+        if pcp_enabled:
+            from vllm_ascend.attention.context_parallel.mla_cp import AscendMLAPCPImpl
+
+            return AscendMLAPCPImpl
         return AscendMLAImpl
 
     @staticmethod
