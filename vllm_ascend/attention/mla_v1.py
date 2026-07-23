@@ -6,9 +6,13 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 import vllm.envs as envs_vllm
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
+from vllm.distributed.parallel_state import get_pcp_group
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
+from vllm.model_executor.layers.attention.pcp import (
+    maybe_gather_mla_latent_cache_inputs,
+)
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.attention.backend import (
@@ -69,6 +73,14 @@ BUILD_METADATA_STEP_DECODE = 1
 MLAPO_MAX_SUPPORTED_TOKENS = 1024
 
 
+def _use_mrv2_pcp(vllm_config: VllmConfig | None = None) -> bool:
+    if not envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
+        return False
+    if vllm_config is None:
+        vllm_config = get_current_vllm_config()
+    return vllm_config.parallel_config.prefill_context_parallel_size > 1
+
+
 class AscendMLABackend(AttentionBackend):
     accept_output_buffer: bool = True
 
@@ -82,6 +94,8 @@ class AscendMLABackend(AttentionBackend):
     @staticmethod
     def get_builder_cls():
         if enable_cp():
+            if _use_mrv2_pcp():
+                return AscendMLAMetadataBuilder
             from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaCPMetadataBuilder
 
             return AscendMlaCPMetadataBuilder
@@ -100,6 +114,8 @@ class AscendMLABackend(AttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["MLAAttentionImpl"]:
         if enable_cp():
+            if _use_mrv2_pcp():
+                return AscendMLAImpl
             from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaCPImpl
 
             return AscendMlaCPImpl
@@ -198,6 +214,12 @@ class AscendMLAMetadata:
 
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
+    # MRV2 PCP passes the expanded write mapping produced by PCPManager while
+    # attention itself continues to use the rank-local slot_mapping above.
+    pcp_slot_mapping: torch.Tensor | None = None
+    # Positions include rank-local PCP padding so latent KV collectives use the
+    # same tensor shape on every rank.
+    pcp_positions: torch.Tensor | None = None
 
     query_lens: list[int] | None = None
     # The dimension of the attention heads
@@ -250,7 +272,21 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         scheduler_config = vllm_config.scheduler_config
         self.block_size = vllm_config.cache_config.block_size
         self.max_blocks = (vllm_config.model_config.max_model_len + self.block_size - 1) // self.block_size
-        self.chunked_prefill_enabled = scheduler_config.enable_chunked_prefill
+        self.use_mrv2_pcp = _use_mrv2_pcp(vllm_config)
+        if self.use_mrv2_pcp:
+            parallel_config = vllm_config.parallel_config
+            if parallel_config.decode_context_parallel_size > 1:
+                raise NotImplementedError("MRV2 Ascend MLA PCP does not support DCP yet.")
+            if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+                raise NotImplementedError("MRV2 Ascend MLA PCP currently requires eager mode.")
+            if vllm_config.cache_config.enable_prefix_caching:
+                raise NotImplementedError("MRV2 Ascend MLA PCP does not support prefix caching yet.")
+            if hasattr(vllm_config.model_config.hf_text_config, "index_topk"):
+                raise NotImplementedError("MRV2 Ascend MLA PCP currently supports dense MLA only.")
+
+        # A non-head virtual PCP request has an existing context even when the
+        # scheduler did not globally enable chunked prefill.
+        self.chunked_prefill_enabled = scheduler_config.enable_chunked_prefill or self.use_mrv2_pcp
 
         self.speculative_config = vllm_config.speculative_config
         self.decode_threshold = 1
@@ -433,15 +469,50 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=self.decode_threshold,
-                treat_short_extends_as_decodes=common_attn_metadata.prefill_context_parallel_metadata is None,
+                treat_short_extends_as_decodes=(
+                    not self.use_mrv2_pcp and common_attn_metadata.prefill_context_parallel_metadata is None
+                ),
             )
         )
         self.set_num_actual_tokens(common_attn_metadata)
         assert self.num_decodes + self.num_prefills == num_reqs
         assert self.num_decode_tokens + self.num_prefill_tokens == common_attn_metadata.num_actual_tokens
 
-        # NOTE: Currently, MTP-fullgraph is incompatibility pcp
-        self.slot_mapping = common_attn_metadata.slot_mapping[: self.num_actual_tokens]
+        pcp_slot_mapping = None
+        pcp_positions = None
+        num_tokens_pcp_padded = self.num_actual_tokens
+        if self.use_mrv2_pcp:
+            num_tokens_pcp_padded = common_attn_metadata.num_input_tokens
+            if num_tokens_pcp_padded < self.num_actual_tokens:
+                raise AssertionError("MRV2 PCP padded token count cannot be smaller than the rank-local token count.")
+            if common_attn_metadata.positions is None:
+                raise AssertionError("MRV2 PCP requires rank-local positions.")
+
+            pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
+            expanded_num_tokens = pcp_size * num_tokens_pcp_padded
+            if common_attn_metadata.slot_mapping.shape[0] < expanded_num_tokens:
+                raise AssertionError("MRV2 PCP requires expanded slot mappings for every PCP rank.")
+
+            # Community PCP buffers are int64 at the pinned vLLM revision,
+            # while Ascend cache update kernels require int32. This is a no-op
+            # once the manager provides int32 buffers.
+            pcp_slot_mapping = common_attn_metadata.slot_mapping[:expanded_num_tokens].to(torch.int32)
+            pcp_rank = get_pcp_group().rank_in_group
+            local_slot_start = pcp_rank * num_tokens_pcp_padded
+            local_rank_slot_mapping = pcp_slot_mapping[local_slot_start : local_slot_start + self.num_actual_tokens]
+            # Expanded mappings suppress duplicate decode writes on nonzero
+            # ranks. Every rank owns a full MRV2 KV cache, so use rank 0's
+            # logical decode slots and this rank's prefill slots.
+            self.slot_mapping = torch.cat(
+                (
+                    pcp_slot_mapping[: self.num_decode_tokens],
+                    local_rank_slot_mapping[self.num_decode_tokens :],
+                )
+            )
+            pcp_positions = common_attn_metadata.positions[:num_tokens_pcp_padded]
+        else:
+            # NOTE: Currently, MTP-fullgraph is incompatibility pcp
+            self.slot_mapping = common_attn_metadata.slot_mapping[: self.num_actual_tokens]
 
         query_seq_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         self.query_lens = query_seq_lens_cpu[:num_reqs]
@@ -466,7 +537,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         if self.num_decodes > 0:
             decode_metadata = self.build_decode_metadata(common_prefix_len, common_attn_metadata)
         return self.metadata_cls(  # type: ignore
-            num_actual_tokens_pcp_padded=self.num_actual_tokens,
+            num_actual_tokens_pcp_padded=num_tokens_pcp_padded,
             num_input_tokens=common_attn_metadata.num_input_tokens,
             num_actual_tokens=self.num_actual_tokens,
             query_lens=self.query_lens.tolist(),
@@ -483,6 +554,8 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             block_tables=self.block_table,
             seq_lens=self.seq_lens,
             seq_lens_cpu=self.seq_lens,
+            pcp_slot_mapping=pcp_slot_mapping,
+            pcp_positions=pcp_positions,
         )
 
     def build_chunked_metadata(
@@ -717,6 +790,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         **kwargs,
     ):
         self.vllm_config = get_current_vllm_config()
+        self.use_mrv2_pcp = _use_mrv2_pcp(self.vllm_config)
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -1618,6 +1692,117 @@ class AscendMLAImpl(MLAAttentionImpl):
             decode_ql_nope, decode_q_pe, decode_k_nope, decode_k_pe, dequant_scale_q_nope=dequant_scale_q_nope
         )
 
+    def _build_pcp_latent_kv(
+        self,
+        kv_no_split: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: AscendMLAMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_input_tokens = attn_metadata.num_input_tokens
+        if num_input_tokens <= 0:
+            raise AssertionError("MRV2 PCP requires a positive padded token count.")
+        if kv_no_split.shape[0] < num_input_tokens:
+            raise AssertionError("MLA projection output is shorter than the PCP padded batch.")
+        if attn_metadata.pcp_positions is None:
+            raise AssertionError("MRV2 PCP requires padded input positions.")
+        if attn_metadata.pcp_slot_mapping is None:
+            raise AssertionError("MRV2 PCP requires expanded slot mappings.")
+
+        cos, sin = get_cos_and_sin_mla(attn_metadata.pcp_positions[:num_input_tokens].long())
+        pad_slots = torch.full(
+            (num_input_tokens,),
+            PAD_SLOT_ID,
+            dtype=attn_metadata.pcp_slot_mapping.dtype,
+            device=kv_no_split.device,
+        )
+        # Reuse the existing fused RMSNorm/RoPE implementation for numerical
+        # parity. PAD slots prevent this projection-only call from modifying
+        # any valid cache entry.
+        k_pe, kv_c_normed = self.exec_kv_prefill(
+            kv_no_split[:num_input_tokens],
+            cos,
+            sin,
+            kv_cache,
+            pad_slots,
+        )
+        kv_c_normed = kv_c_normed.view(num_input_tokens, self.num_kv_heads, self.kv_lora_rank)
+        k_pe = k_pe.view(num_input_tokens, self.num_kv_heads, self.qk_rope_head_dim)
+        return kv_c_normed, k_pe
+
+    def _write_gathered_pcp_prefill_cache(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: AscendMLAMetadata,
+    ) -> None:
+        if attn_metadata.pcp_slot_mapping is None:
+            raise AssertionError("MRV2 PCP requires expanded slot mappings.")
+
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        cache_kv_c, cache_k_pe, cache_slot_mapping = maybe_gather_mla_latent_cache_inputs(
+            kv_c_normed,
+            k_pe,
+            attn_metadata.pcp_slot_mapping,
+            num_decode_tokens,
+            True,
+        )
+        if cache_slot_mapping is None:
+            raise AssertionError("MRV2 PCP cache slot mapping cannot be None.")
+
+        # Decode tokens are replicated and were already written by
+        # mla_preprocess_decode on every PCP rank. Only write the gathered
+        # prefill suffix; padding entries retain PAD_SLOT_ID.
+        DeviceOperator.reshape_and_cache(
+            key=cache_kv_c[num_decode_tokens:],
+            value=cache_k_pe[num_decode_tokens:],
+            key_cache=kv_cache[0],
+            value_cache=kv_cache[1],
+            slot_mapping=cache_slot_mapping[num_decode_tokens:],
+        )
+
+    def _build_local_pcp_prefill_inputs(
+        self,
+        q_c: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        attn_metadata: AscendMLAMetadata,
+    ) -> PrefillMLAPreprocessResult:
+        prefill_metadata = attn_metadata.prefill
+        if prefill_metadata is None:
+            raise AssertionError("MRV2 PCP prefill metadata is required.")
+
+        prefill_start = attn_metadata.num_decode_tokens
+        prefill_end = attn_metadata.num_actual_tokens
+        prefill_q_c = q_c[prefill_start:prefill_end]
+        prefill_q = self.q_proj(prefill_q_c)[0].view(-1, self.num_heads, self.qk_head_dim)
+        prefill_q_nope, prefill_q_pe = prefill_q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        prefill_q_pe = self.rope_single(
+            prefill_q_pe,
+            prefill_metadata.cos,
+            prefill_metadata.sin,
+        )
+
+        local_kv_c = kv_c_normed[prefill_start:prefill_end].squeeze(1)
+        prefill_k_nope, prefill_value = (
+            self.kv_b_proj(local_kv_c)[0]
+            .view(
+                -1,
+                self.num_heads,
+                self.qk_nope_head_dim + self.v_head_dim,
+            )
+            .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        )
+        local_k_pe = k_pe[prefill_start:prefill_end]
+        local_k_pe = local_k_pe.expand((*prefill_k_nope.shape[:-1], -1))
+        return PrefillMLAPreprocessResult(
+            prefill_q_nope,
+            prefill_q_pe,
+            prefill_k_nope,
+            local_k_pe,
+            prefill_value,
+        )
+
     def _mla_preprocess(self, layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv):
         # MLA Preprocess:
         # 1. Perform fused_qkv_a_proj and q_a_layernorm to obtain q_c and kv_no_split
@@ -1646,6 +1831,18 @@ class AscendMLAImpl(MLAAttentionImpl):
         # Process for Flash Comm V1
         q_c = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(q_c.contiguous(), need_gather_q_kv)
         kv_no_split = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(kv_no_split.contiguous(), need_gather_q_kv)
+
+        if self.use_mrv2_pcp and has_prefill:
+            wait_for_kv_layer_from_connector(layer_name)
+            decode_preprocess_res = None
+            if has_decode:
+                decode_preprocess_res = self.mla_preprocess_decode(q_c, kv_no_split, kv_cache, attn_metadata)
+
+            kv_c_normed, k_pe = self._build_pcp_latent_kv(kv_no_split, kv_cache, attn_metadata)
+            self._write_gathered_pcp_prefill_cache(kv_c_normed, k_pe, kv_cache, attn_metadata)
+            prefill_preprocess_res = self._build_local_pcp_prefill_inputs(q_c, kv_c_normed, k_pe, attn_metadata)
+            notify_kv_cache_written(layer_name)
+            return decode_preprocess_res, prefill_preprocess_res
 
         decode_preprocess_res = None
         prefill_preprocess_res = None

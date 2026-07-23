@@ -71,7 +71,9 @@ class AscendModelState(DefaultModelState):
             # extra attributes for ascend npus.
             seq_lens_np=input_batch.seq_lens_np,
             positions=input_batch.positions,
+            is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
             attn_state=input_batch.attn_state,
+            num_input_tokens=input_batch.num_tokens_after_padding,
             for_cudagraph_capture=for_capture,
         )
         return self.attn_metadata

@@ -178,3 +178,47 @@ FULL_FEATURE_MODEL_CASES = [
 @pytest.mark.parametrize("case", FULL_FEATURE_MODEL_CASES, ids=lambda case: case.name)
 def test_models_pcp_dcp_full_feature_accuracy(case: AccuracyCase) -> None:
     _run_accuracy_case(case)
+
+
+MRV2_MLA_PCP_MODEL = "vllm-ascend/DeepSeek-V2-Lite-W8A8"
+MRV2_MLA_PCP_PROMPTS = [
+    ("Context parallel attention must preserve the exact causal history for every token in a long prompt. ") * 96,
+    "The capital of France is",
+    "Explain in one sentence why padding tokens must not update a KV cache.",
+]
+
+
+def _run_mrv2_mla_pcp(pcp_size: int) -> list[list[int]]:
+    with VllmRunner(
+        MRV2_MLA_PCP_MODEL,
+        max_model_len=2048,
+        max_num_seqs=len(MRV2_MLA_PCP_PROMPTS),
+        max_num_batched_tokens=2048,
+        tensor_parallel_size=1,
+        prefill_context_parallel_size=pcp_size,
+        decode_context_parallel_size=1,
+        enforce_eager=True,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=128,
+        quantization="ascend",
+        seed=0,
+    ) as runner:
+        outputs = runner.generate_greedy(MRV2_MLA_PCP_PROMPTS, max_tokens=16)
+    return [token_ids for token_ids, _ in outputs]
+
+
+@patch.dict(
+    os.environ,
+    {
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    },
+)
+@wait_until_npu_memory_free(target_free_percentage=0.8)
+def test_mrv2_dense_mla_pcp_token_ids_match() -> None:
+    baseline_token_ids = _run_mrv2_mla_pcp(1)
+
+    for pcp_size in (2, 4):
+        actual_token_ids = _run_mrv2_mla_pcp(pcp_size)
+        assert actual_token_ids == baseline_token_ids, f"PCP={pcp_size} token IDs differ from PCP=1"
