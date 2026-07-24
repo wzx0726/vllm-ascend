@@ -7,6 +7,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_pcp_group
 from vllm.model_executor.layers.attention.pcp import _gather_prefill_cache_inputs
 from vllm.utils.math_utils import cdiv
+from vllm.logger import logger
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
@@ -171,6 +172,13 @@ class AscendMLAPCPImpl(AscendMLAImpl):
             (local_prefill_kv, padded_cos, padded_sin),
             expanded_prefill_slots,
             num_decode_tokens=0,
+        )
+        logger.info_once(
+            "[MLA PCP] rank=%d, local_kv=%s, gathered_kv=%s, slots=%s",
+            pcp_group.rank_in_group,
+            tuple(local_prefill_kv.shape),
+            tuple(gathered_kv.shape),
+            tuple(gathered_prefill_slots.shape),
         )
 
         gathered_k_pe, gathered_k_c_normed = self.exec_kv_prefill(

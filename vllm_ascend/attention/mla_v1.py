@@ -82,6 +82,7 @@ class AscendMLABackend(AttentionBackend):
     def get_builder_cls():
         dcp_enabled = enable_dcp()
         pcp_enabled = get_current_vllm_config().parallel_config.prefill_context_parallel_size > 1
+        pcp_size = get_current_vllm_config().parallel_config.prefill_context_parallel_size
         if dcp_enabled and pcp_enabled:
             raise NotImplementedError("Ascend MRV2 MLA does not support PCP and DCP simultaneously yet.")
         if dcp_enabled:
@@ -90,7 +91,12 @@ class AscendMLABackend(AttentionBackend):
             return AscendMlaDCPMetadataBuilder
         if pcp_enabled:
             from vllm_ascend.attention.context_parallel.mla_cp import AscendMLAPCPMetadataBuilder
-
+            logger.info_once(
+                        "[MLA PCP] select metadata builder: "
+                        "class=%s, pcp_size=%d",
+                        AscendMLAPCPMetadataBuilder.__name__,
+                        pcp_size,
+                    )
             return AscendMLAPCPMetadataBuilder
         return AscendMLAMetadataBuilder
 

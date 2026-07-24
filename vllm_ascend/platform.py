@@ -997,6 +997,12 @@ class NPUPlatform(Platform):
                 pad_size = padded_length - num_tokens
         else:
             max_tokens_across_dp = num_tokens
+        # MRV2 PCPManager pads every PCP rank to the same local token count
+        # before model execution. MoE performs its DP all-gather before the
+        # PCP all-gather, so the PCP padding target must describe the tensor
+        # after DP gathering. This field used to be supplied by the Ascend V1
+        # PCP manager and is still consumed by PrepareAndFinalizeWithAllGather.
+        max_tokens_across_pcp = max_tokens_across_dp * dp_world_size
         mc2_mask = None
         padded_num_tokens = None
         if num_tokens is not None:
@@ -1018,6 +1024,7 @@ class NPUPlatform(Platform):
             "pad_size": pad_size,
             "padded_length": padded_length,
             "max_tokens_across_dp": max_tokens_across_dp,
+            "max_tokens_across_pcp": max_tokens_across_pcp,
             "mc2_mask": mc2_mask,
             "is_draft_model": is_draft_model,
             "is_draft_model_prefill": is_draft_model_prefill,
