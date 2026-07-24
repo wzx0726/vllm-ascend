@@ -173,7 +173,7 @@ class AscendMLAPCPImpl(AscendMLAImpl):
             expanded_prefill_slots,
             num_decode_tokens=0,
         )
-        logger.info_once(
+        logger.info(
             "[MLA PCP] rank=%d, local_kv=%s, gathered_kv=%s, slots=%s",
             pcp_group.rank_in_group,
             tuple(local_prefill_kv.shape),

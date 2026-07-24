@@ -91,7 +91,7 @@ class AscendMLABackend(AttentionBackend):
             return AscendMlaDCPMetadataBuilder
         if pcp_enabled:
             from vllm_ascend.attention.context_parallel.mla_cp import AscendMLAPCPMetadataBuilder
-            logger.info_once(
+            logger.info(
                         "[MLA PCP] select metadata builder: "
                         "class=%s, pcp_size=%d",
                         AscendMLAPCPMetadataBuilder.__name__,
