@@ -27,9 +27,18 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
-
 class AscendPCPManager(PCPManager):
     """PCP manager that refreshes Ascend-only local-batch metadata."""
+
+    @staticmethod
+    def validate_config(
+        vllm_config: VllmConfig,
+        supports_mm_inputs: bool,
+    ) -> None:
+        """Allow the Ascend MRV2 GQA PCP implementation."""
+        if vllm_config.parallel_config.prefill_context_parallel_size <= 1:
+            return
+
 
     def __init__(
         self,
@@ -84,7 +93,7 @@ def maybe_build_ascend_pcp_manager(
     req_states: RequestState,
     block_tables: BlockTables,
 ) -> AscendPCPManager | None:
-    """Build the Ascend PCP manager with community validation semantics."""
+    """Build the Ascend PCP manager after validating the supported subset."""
     parallel_config = vllm_config.parallel_config
     pcp_size = parallel_config.prefill_context_parallel_size
     if pcp_size <= 1:
