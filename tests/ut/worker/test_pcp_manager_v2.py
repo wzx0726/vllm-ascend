@@ -22,14 +22,19 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
+from vllm.v1.worker.gpu import pcp_manager as vllm_pcp_manager_module
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.pcp_manager import PCPManager
+from vllm.v1.worker.gpu.pcp_manager import (
+    PCPManager,
+    PCPManagerRegistry,
+    maybe_build_pcp_manager,
+)
 
 import vllm_ascend.worker.v2.pcp_manager as pcp_manager_module
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.pcp_manager import (
+    ASCEND_PCP_MANAGER_NAME,
     AscendPCPManager,
-    maybe_build_ascend_pcp_manager,
 )
 
 
@@ -174,24 +179,32 @@ def test_partition_batch_refreshes_local_ascend_input_batch_metadata():
     np.testing.assert_array_equal(args[4], np.array([3, 5], dtype=np.int32))
 
 
-def test_maybe_build_ascend_pcp_manager_returns_none_when_pcp_is_disabled():
+def test_ascend_pcp_manager_is_registered():
+    assert (
+        PCPManagerRegistry.get_manager_class(ASCEND_PCP_MANAGER_NAME)
+        is AscendPCPManager
+    )
+
+
+def test_maybe_build_pcp_manager_returns_none_when_pcp_is_disabled():
     vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
     )
 
     assert (
-        maybe_build_ascend_pcp_manager(
+        maybe_build_pcp_manager(
             vllm_config,
             torch.device("cpu"),
             supports_mm_inputs=False,
             req_states=MagicMock(),
             block_tables=MagicMock(),
+            manager_name=ASCEND_PCP_MANAGER_NAME,
         )
         is None
     )
 
 
-def test_maybe_build_ascend_pcp_manager_uses_ascend_subclass():
+def test_maybe_build_pcp_manager_uses_registered_ascend_subclass():
     vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=2,
@@ -205,23 +218,39 @@ def test_maybe_build_ascend_pcp_manager_uses_ascend_subclass():
     req_states = MagicMock()
 
     with (
-        patch.object(PCPManager, "validate_config") as validate_config,
-        patch.object(pcp_manager_module, "get_pcp_group", return_value=pcp_group),
-        patch.object(pcp_manager_module, "get_dcp_group", return_value=dcp_group),
+        patch.object(AscendPCPManager, "validate_config") as validate_config,
+        patch.object(
+            vllm_pcp_manager_module,
+            "get_pcp_group",
+            return_value=pcp_group,
+        ),
+        patch.object(
+            vllm_pcp_manager_module,
+            "get_dcp_group",
+            return_value=dcp_group,
+        ),
     ):
-        manager = maybe_build_ascend_pcp_manager(
+        manager = maybe_build_pcp_manager(
             vllm_config,
             torch.device("cpu"),
             supports_mm_inputs=False,
             req_states=req_states,
             block_tables=None,
+            manager_name=ASCEND_PCP_MANAGER_NAME,
         )
 
     assert isinstance(manager, AscendPCPManager)
-    assert manager.vllm_config is vllm_config
+    assert manager.vllm_config is None
     assert manager.pcp_world_size == 2
     assert manager.pcp_rank == 1
     assert manager.dcp_world_size == 2
     assert manager.dcp_rank == 0
     assert manager.cp_interleave == 4
     validate_config.assert_called_once_with(vllm_config, False)
+
+    manager.vllm_config = vllm_config
+    assert manager.vllm_config is vllm_config
+
+
+def test_ascend_pcp_validation_is_platform_specific():
+    assert AscendPCPManager.validate_config is not PCPManager.validate_config
