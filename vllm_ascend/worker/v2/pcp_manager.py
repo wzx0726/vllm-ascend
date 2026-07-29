@@ -38,25 +38,7 @@ class AscendPCPManager(PCPManager):
         if parallel_config.prefill_context_parallel_size <= 1:
             return
 
-        if parallel_config.decode_context_parallel_size > 1:
-            raise NotImplementedError(
-                "Ascend MRV2 PCP does not support PCP and DCP "
-                "simultaneously yet."
-            )
-        if parallel_config.pipeline_parallel_size > 1:
-            raise NotImplementedError("Ascend MRV2 PCP does not support PP yet.")
-        if model_config.is_encoder_decoder:
-            raise NotImplementedError(
-                "Ascend MRV2 PCP does not support encoder-decoder models yet."
-            )
-        if supports_mm_inputs:
-            raise NotImplementedError(
-                "Ascend MRV2 PCP does not support MM inputs yet."
-            )
-        if vllm_config.lora_config is not None:
-            raise NotImplementedError(
-                "Ascend MRV2 PCP does not support LoRA yet."
-            )
+
 
     def __init__(
         self,

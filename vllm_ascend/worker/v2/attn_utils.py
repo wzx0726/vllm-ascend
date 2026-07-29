@@ -162,6 +162,7 @@ def build_attn_metadata(
         )
 
         for attn_group in attn_groups[i]:
+            # 这里进入mla.v1.py里面的Build函数，进行mla_attn的构建
             attn_metadata_builder = attn_group.get_metadata_builder(0)
             if for_cudagraph_capture:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(common_attn_metadata)
