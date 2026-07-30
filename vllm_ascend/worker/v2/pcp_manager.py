@@ -17,7 +17,13 @@
 # This file is a part of the vllm-ascend project.
 #
 
+from dataclasses import replace
+
+import numpy as np
+import torch
 from vllm.config import VllmConfig
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.pcp_manager import PCPManager, PCPManagerRegistry
 
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
@@ -34,11 +40,9 @@ class AscendPCPManager(PCPManager):
     ) -> None:
         """Validate the PCP subset implemented by the Ascend MRV2 runner."""
         parallel_config = vllm_config.parallel_config
-        model_config = vllm_config.model_config
-        if parallel_config.prefill_context_parallel_size <= 1:
+        pcp_size = parallel_config.prefill_context_parallel_size
+        if pcp_size <= 1:
             return
-
-
 
     def __init__(
         self,
@@ -52,11 +56,14 @@ class AscendPCPManager(PCPManager):
     def partition_batch(self, input_batch: AscendInputBatch) -> AscendInputBatch:
         """Partition the batch and update Ascend-specific local metadata."""
         assert self.vllm_config is not None
+        graph_num_reqs = input_batch.num_reqs_after_padding
+        graph_num_tokens = input_batch.num_tokens_after_padding
+        is_decode_only = not np.any(input_batch.is_prefilling_np)
+
         local_batch = super().partition_batch(input_batch)
         assert isinstance(local_batch, AscendInputBatch)
 
         local_seq_lens_np = local_batch.num_computed_tokens_np + local_batch.num_scheduled_tokens
-        local_batch.seq_lens_np = local_seq_lens_np
         local_batch.attn_state = build_attn_state(
             self.vllm_config,
             local_seq_lens_np,
@@ -64,7 +71,141 @@ class AscendPCPManager(PCPManager):
             local_batch.num_scheduled_tokens,
             local_batch.num_scheduled_tokens,
         )
+        if is_decode_only:
+            return self._pad_decode_batch_for_full_graph(
+                local_batch,
+                graph_num_reqs,
+                graph_num_tokens,
+                local_seq_lens_np,
+            )
+
+        local_batch.seq_lens_np = local_seq_lens_np
         return local_batch
+
+    def _pad_decode_batch_for_full_graph(
+        self,
+        local_batch: AscendInputBatch,
+        graph_num_reqs: int,
+        graph_num_tokens: int,
+        local_seq_lens_np: np.ndarray,
+    ) -> AscendInputBatch:
+        """Pad a rank-local decode batch to the selected full-graph shape."""
+        num_reqs = local_batch.num_reqs
+        num_tokens = local_batch.num_tokens
+        if graph_num_reqs < num_reqs or graph_num_tokens < num_tokens:
+            raise RuntimeError(
+                "PCP graph shape is smaller than the rank-local decode batch: "
+                f"requests {graph_num_reqs} < {num_reqs} or "
+                f"tokens {graph_num_tokens} < {num_tokens}."
+            )
+
+        num_padding_reqs = graph_num_reqs - num_reqs
+        num_padding_tokens = graph_num_tokens - num_tokens
+        if num_padding_reqs != num_padding_tokens:
+            raise RuntimeError(
+                "PCP FULL_DECODE_ONLY requires one token per padded request: "
+                f"{num_padding_tokens} tokens for {num_padding_reqs} requests."
+            )
+
+        # Full-graph model inputs keep using the model runner's original
+        # buffers, while PCP attention metadata uses the rank-local buffers.
+        # Clear both views so a smaller replay cannot observe stale padding
+        # left by a previously larger decode batch.
+        global_batch = self._global_batch
+        assert global_batch is not None
+        global_batch.input_ids[num_tokens:graph_num_tokens].zero_()
+        global_batch.positions[num_tokens:graph_num_tokens].zero_()
+        global_batch.is_padding[:num_tokens].fill_(False)
+        global_batch.is_padding[num_tokens:graph_num_tokens].fill_(True)
+
+        if num_padding_reqs == 0:
+            local_batch.seq_lens_np = local_seq_lens_np
+            return local_batch
+
+        input_buffers = self._input_buffers
+        assert input_buffers is not None
+        if graph_num_reqs > input_buffers.max_num_reqs:
+            raise RuntimeError(
+                "PCP graph request count exceeds the local input buffer capacity: "
+                f"{graph_num_reqs} > {input_buffers.max_num_reqs}."
+            )
+        if graph_num_tokens > input_buffers.max_num_tokens:
+            raise RuntimeError(
+                "PCP graph token count exceeds the local input buffer capacity: "
+                f"{graph_num_tokens} > {input_buffers.max_num_tokens}."
+            )
+
+        input_buffers.input_ids[num_tokens:graph_num_tokens].zero_()
+        input_buffers.positions[num_tokens:graph_num_tokens].zero_()
+        input_buffers.seq_lens[num_reqs:graph_num_reqs].zero_()
+        input_buffers.is_padding[:num_tokens].fill_(False)
+        input_buffers.is_padding[num_tokens:graph_num_tokens].fill_(True)
+
+        query_start_loc_np = np.empty(graph_num_reqs + 1, dtype=np.int32)
+        query_start_loc_np[: num_reqs + 1] = local_batch.query_start_loc_np
+        query_start_loc_np[num_reqs + 1 :] = num_tokens + np.arange(
+            1,
+            num_padding_reqs + 1,
+            dtype=np.int32,
+        )
+        async_copy_to_gpu(query_start_loc_np, out=input_buffers.query_start_loc)
+
+        padded_seq_lens_np = np.zeros(graph_num_reqs, dtype=np.int32)
+        padded_seq_lens_np[:num_reqs] = local_seq_lens_np
+        seq_lens_cpu_upper_bound = torch.zeros(graph_num_reqs, dtype=torch.int32)
+        seq_lens_cpu_upper_bound[:num_reqs].copy_(local_batch.seq_lens_cpu_upper_bound)
+
+        return replace(
+            local_batch,
+            num_reqs_after_padding=graph_num_reqs,
+            num_tokens_after_padding=graph_num_tokens,
+            query_start_loc=input_buffers.query_start_loc[: graph_num_reqs + 1],
+            query_start_loc_np=query_start_loc_np,
+            seq_lens=input_buffers.seq_lens[:graph_num_reqs],
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            input_ids=input_buffers.input_ids[:graph_num_tokens],
+            positions=input_buffers.positions[:graph_num_tokens],
+            is_padding=input_buffers.is_padding[:graph_num_tokens],
+            seq_lens_np=padded_seq_lens_np,
+        )
+
+    def prepare_dummy_attn(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        """Prepare capture inputs using the same buffers as graph replay."""
+        assert self._local_block_tables is not None
+        for block_table in self._local_block_tables:
+            block_table[:num_reqs].zero_()
+        return (
+            tuple(block_table[:num_reqs] for block_table in self._local_block_tables),
+            self.get_dummy_slot_mappings(num_tokens),
+        )
+
+    def prepare_slot_mappings(self) -> torch.Tensor:
+        slot_mappings = super().prepare_slot_mappings()
+        assert self._global_batch is not None
+        assert self._gathered_kv_slot_mappings is not None
+
+        global_batch = self._global_batch
+        if np.any(global_batch.is_prefilling_np):
+            return slot_mappings
+
+        graph_num_tokens = global_batch.num_tokens_after_padding
+        if graph_num_tokens <= global_batch.num_tokens:
+            return slot_mappings
+
+        num_expanded_tokens = slot_mappings.shape[1]
+        graph_num_expanded_tokens = graph_num_tokens * self.pcp_world_size
+        if graph_num_expanded_tokens > self._gathered_kv_slot_mappings.shape[1]:
+            raise RuntimeError(
+                "PCP graph slot mapping exceeds the persistent buffer capacity: "
+                f"{graph_num_expanded_tokens} > "
+                f"{self._gathered_kv_slot_mappings.shape[1]}."
+            )
+        self._gathered_kv_slot_mappings[:, num_expanded_tokens:graph_num_expanded_tokens].fill_(PAD_SLOT_ID)
+        return self._gathered_kv_slot_mappings[:, :graph_num_expanded_tokens]
 
 
 ASCEND_PCP_MANAGER_NAME = "ascend"

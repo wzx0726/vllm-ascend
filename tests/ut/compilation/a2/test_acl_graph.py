@@ -13,9 +13,12 @@
 # This file is a part of the vllm-ascend project.
 #
 import weakref
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
+import pytest
 import torch
 from vllm.compilation.cuda_graph import CUDAGraphOptions
 from vllm.config import CUDAGraphMode, VllmConfig
@@ -42,6 +45,10 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.device_allocator.sleep_mem_optimized import AclGraphSleepWakeupManager
+from vllm_ascend.worker.v2 import aclgraph_utils as worker_aclgraph_utils
+from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
+from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
+from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 
 
 def test_update_full_graph_params_dispatches_draft_metadata_by_keyword():
@@ -72,6 +79,196 @@ def test_update_full_graph_params_dispatches_draft_metadata_by_keyword():
         speculative_config,
         draft_attn_metadatas=draft_attn_metadatas,
     )
+
+
+def test_prepare_pcp_inputs_to_capture_uses_partitioned_persistent_buffers():
+    events = []
+    input_buffers = AscendInputBuffers(
+        max_num_reqs=4,
+        max_num_tokens=8,
+        device=torch.device("cpu"),
+    )
+    input_batch = SimpleNamespace(
+        num_reqs_after_padding=4,
+        num_tokens_after_padding=4,
+    )
+    block_table = torch.zeros(4, 2, dtype=torch.int32)
+    slot_mapping = torch.arange(8, dtype=torch.int64).view(1, 8)
+    layer_slot_mappings = {"layer": slot_mapping[0]}
+    pcp_manager = MagicMock(spec=AscendPCPManager)
+    model_state = MagicMock()
+    attn_metadata = {"layer": object()}
+    model_state.prepare_attn.return_value = attn_metadata
+
+    def partition_batch(batch):
+        events.append("partition")
+        assert batch is input_batch
+        return input_batch
+
+    def prepare_dummy_attn(num_reqs, num_tokens):
+        events.append("dummy_attn")
+        assert (num_reqs, num_tokens) == (4, 4)
+        return (block_table,), slot_mapping
+
+    def prepare_attn(*args, **kwargs):
+        events.append("metadata")
+        return attn_metadata
+
+    pcp_manager.partition_batch.side_effect = partition_batch
+    pcp_manager.prepare_dummy_attn.side_effect = prepare_dummy_attn
+    model_state.prepare_attn.side_effect = prepare_attn
+
+    with (
+        patch.object(
+            AscendInputBatch,
+            "make_dummy",
+            return_value=input_batch,
+        ) as make_dummy,
+        patch.object(
+            worker_aclgraph_utils.cudagraph_utils,
+            "build_slot_mappings_by_layer",
+            return_value=layer_slot_mappings,
+        ) as build_slot_mappings,
+    ):
+        state = worker_aclgraph_utils._prepare_pcp_inputs_to_capture(
+            4,
+            4,
+            model_state,
+            input_buffers,
+            MagicMock(),
+            [[MagicMock()]],
+            MagicMock(),
+            pcp_manager,
+        )
+
+    assert events == ["partition", "dummy_attn", "metadata"]
+    make_dummy.assert_called_once_with(4, 4, input_buffers)
+    assert model_state.prepare_attn.call_args.args[0] is input_batch
+    assert model_state.prepare_attn.call_args.args[1] == CUDAGraphMode.NONE
+    assert model_state.prepare_attn.call_args.args[2][0].data_ptr() == (block_table.data_ptr())
+    assert model_state.prepare_attn.call_args.args[3].data_ptr() == (slot_mapping.data_ptr())
+    assert model_state.prepare_attn.call_args.kwargs["for_capture"] is True
+    build_slot_mappings.assert_called_once()
+    assert state.attn_metadata is attn_metadata
+    assert state.slot_mappings is layer_slot_mappings
+
+
+def _make_model_acl_graph_manager(pcp_manager):
+    manager = ModelAclGraphManager.__new__(ModelAclGraphManager)
+    manager.model_runner = SimpleNamespace(pcp_manager=pcp_manager)
+    manager.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+    return manager
+
+
+def _capture_with_mock_inputs(manager):
+    return manager.capture(
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+        None,
+        MagicMock(),
+        [],
+        MagicMock(),
+    )
+
+
+def test_pcp_full_capture_temporarily_installs_and_restores_preparation():
+    pcp_manager = AscendPCPManager.__new__(AscendPCPManager)
+    manager = _make_model_acl_graph_manager(pcp_manager)
+    original_prepare = worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture
+    prepared_state = object()
+
+    def capture_side_effect(*args, **kwargs):
+        installed_prepare = worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture
+        assert installed_prepare is not original_prepare
+        return installed_prepare(
+            2,
+            2,
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+            [],
+            MagicMock(),
+        )
+
+    with (
+        patch.object(
+            worker_aclgraph_utils,
+            "communicator_switch",
+            side_effect=lambda: nullcontext(),
+        ),
+        patch.object(
+            worker_aclgraph_utils,
+            "_prepare_pcp_inputs_to_capture",
+            return_value=prepared_state,
+        ) as prepare_pcp,
+        patch.object(
+            worker_aclgraph_utils.ModelCudaGraphManager,
+            "capture",
+            side_effect=capture_side_effect,
+        ),
+    ):
+        result = _capture_with_mock_inputs(manager)
+
+    assert result is prepared_state
+    assert worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture is original_prepare
+    assert prepare_pcp.call_args.args[7] is pcp_manager
+    assert prepare_pcp.call_args.kwargs["skip_attn"] is False
+
+
+def test_pcp_full_capture_restores_preparation_after_exception():
+    pcp_manager = AscendPCPManager.__new__(AscendPCPManager)
+    manager = _make_model_acl_graph_manager(pcp_manager)
+    original_prepare = worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture
+
+    def capture_side_effect(*args, **kwargs):
+        assert worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture is not original_prepare
+        raise RuntimeError("capture failed")
+
+    with (
+        patch.object(
+            worker_aclgraph_utils,
+            "communicator_switch",
+            side_effect=lambda: nullcontext(),
+        ),
+        patch.object(
+            worker_aclgraph_utils.ModelCudaGraphManager,
+            "capture",
+            side_effect=capture_side_effect,
+        ),
+        pytest.raises(RuntimeError, match="capture failed"),
+    ):
+        _capture_with_mock_inputs(manager)
+
+    assert worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture is original_prepare
+
+
+def test_non_pcp_capture_keeps_native_preparation():
+    manager = _make_model_acl_graph_manager(None)
+    original_prepare = worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture
+
+    def capture_side_effect(*args, **kwargs):
+        assert worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture is original_prepare
+
+    with (
+        patch.object(
+            worker_aclgraph_utils,
+            "communicator_switch",
+            side_effect=lambda: nullcontext(),
+        ),
+        patch.object(
+            worker_aclgraph_utils,
+            "_prepare_pcp_inputs_to_capture",
+        ) as prepare_pcp,
+        patch.object(
+            worker_aclgraph_utils.ModelCudaGraphManager,
+            "capture",
+            side_effect=capture_side_effect,
+        ),
+    ):
+        _capture_with_mock_inputs(manager)
+
+    prepare_pcp.assert_not_called()
 
 
 class TestACLGraphEntry(TestBase):

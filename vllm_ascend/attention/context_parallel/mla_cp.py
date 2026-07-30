@@ -5,9 +5,9 @@ import torch
 import torch_npu
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_pcp_group
+from vllm.logger import logger
 from vllm.model_executor.layers.attention.pcp import _gather_prefill_cache_inputs
 from vllm.utils.math_utils import cdiv
-from vllm.logger import logger
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
@@ -95,20 +95,29 @@ class AscendMLAPCPMetadataBuilder(AscendMLAMetadataBuilder):
                 f"{metadata.num_actual_tokens} > {local_num_input_tokens}."
             )
 
-        rank_slot_mappings = expanded_slot_mapping.view(self.pcp_size, local_num_input_tokens)
+        rank_slot_mappings = expanded_slot_mapping.view(
+            self.pcp_size,
+            local_num_input_tokens,
+        )
         num_decode_tokens = metadata.num_decode_tokens
         # Decode rows are replicated on every PCP rank. PCPManager keeps the
-        # valid cache-write slots only in rank 0's expanded row. Prefill rows
-        # use the slots belonging to this rank's DualChunkSwap partition.
-        metadata.slot_mapping = torch.cat(
-            (
-                rank_slot_mappings[0, :num_decode_tokens],
-                rank_slot_mappings[
-                    self.pcp_rank,
-                    num_decode_tokens : metadata.num_actual_tokens,
-                ],
+        # valid cache-write slots only in rank 0's expanded row. A decode-only
+        # batch can therefore use the persistent rank-0 view directly, which
+        # keeps the slot mapping address stable between capture and replay.
+        if metadata.num_prefills == 0:
+            metadata.slot_mapping = rank_slot_mappings[0, : metadata.num_actual_tokens]
+        else:
+            # Prefill rows use the slots belonging to this rank's
+            # DualChunkSwap partition.
+            metadata.slot_mapping = torch.cat(
+                (
+                    rank_slot_mappings[0, :num_decode_tokens],
+                    rank_slot_mappings[
+                        self.pcp_rank,
+                        num_decode_tokens : metadata.num_actual_tokens,
+                    ],
+                )
             )
-        )
         metadata.pcp_slot_mapping = expanded_slot_mapping
         metadata.pcp_local_num_input_tokens = local_num_input_tokens
         return metadata
