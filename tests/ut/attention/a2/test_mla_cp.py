@@ -122,6 +122,39 @@ def test_mla_pcp_metadata_uses_rank_zero_decode_slots() -> None:
         )
 
 
+def test_mla_pcp_decode_metadata_uses_persistent_rank_zero_view() -> None:
+    expanded_slots = torch.tensor(
+        [5, 6, -1, -1, 50, 60, -1, -1],
+        dtype=torch.int64,
+    )
+    common_metadata = SimpleNamespace(slot_mapping=expanded_slots)
+    metadata = _make_pcp_metadata(
+        num_actual_tokens=4,
+        num_decode_tokens=4,
+    )
+    metadata.num_decodes = 4
+    metadata.query_start_loc = torch.arange(5, dtype=torch.int32)
+
+    builder = AscendMLAPCPMetadataBuilder.__new__(AscendMLAPCPMetadataBuilder)
+    builder.pcp_size = 2
+    builder.pcp_rank = 1
+    with patch.object(
+        AscendMLAMetadataBuilder,
+        "build",
+        return_value=metadata,
+    ):
+        result = builder.build(0, common_metadata)
+
+    assert result.num_actual_tokens == 4
+    assert result.num_decodes == 4
+    assert result.num_prefills == 0
+    assert result.slot_mapping.data_ptr() == expanded_slots.data_ptr()
+    assert result.slot_mapping.tolist() == [5, 6, -1, -1]
+
+    expanded_slots[1] = 99
+    assert result.slot_mapping[1].item() == 99
+
+
 def test_mla_pcp_prefill_gathers_cache_inputs_and_keeps_local_kv() -> None:
     impl = AscendMLAPCPImpl.__new__(AscendMLAPCPImpl)
     impl.num_heads = 1
