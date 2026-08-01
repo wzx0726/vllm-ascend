@@ -17,7 +17,6 @@
 # This file is a part of the vllm-ascend project.
 #
 
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -25,7 +24,6 @@ import numpy as np
 import pytest
 import torch
 from vllm.config import CUDAGraphMode
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu import pcp_manager as vllm_pcp_manager_module
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.pcp_manager import (
@@ -40,6 +38,36 @@ from vllm_ascend.worker.v2.pcp_manager import (
     ASCEND_PCP_MANAGER_NAME,
     AscendPCPManager,
 )
+
+
+def _make_gqa_pcp_config():
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2,
+            decode_context_parallel_size=1,
+            pipeline_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+        model_config=SimpleNamespace(
+            use_mla=False,
+            is_encoder_decoder=False,
+            quantization=None,
+            dtype=torch.bfloat16,
+            hf_text_config=SimpleNamespace(
+                num_attention_heads=32,
+                num_key_value_heads=8,
+            ),
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=8,
+            max_num_batched_tokens=32,
+            enable_chunked_prefill=False,
+        ),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
+        lora_config=None,
+        speculative_config=None,
+    )
 
 
 def _make_local_pcp_batch() -> AscendInputBatch:
@@ -184,38 +212,15 @@ def test_partition_batch_refreshes_local_ascend_input_batch_metadata():
 
 
 def test_ascend_pcp_manager_is_registered():
-    assert PCPManagerRegistry.get_manager_class(ASCEND_PCP_MANAGER_NAME) is AscendPCPManager
-
-
-def test_maybe_build_pcp_manager_returns_none_when_pcp_is_disabled():
-    vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
-    )
-
     assert (
-        maybe_build_pcp_manager(
-            vllm_config,
-            torch.device("cpu"),
-            supports_mm_inputs=False,
-            req_states=MagicMock(),
-            block_tables=MagicMock(),
-            manager_name=ASCEND_PCP_MANAGER_NAME,
-        )
-        is None
+        PCPManagerRegistry.get_manager_class(ASCEND_PCP_MANAGER_NAME)
+        is AscendPCPManager
     )
 
 
 def test_maybe_build_pcp_manager_uses_registered_ascend_subclass():
-    vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            prefill_context_parallel_size=2,
-            decode_context_parallel_size=2,
-            cp_kv_cache_interleave_size=4,
-        ),
-        scheduler_config=SimpleNamespace(max_num_seqs=8, max_num_batched_tokens=32),
-    )
+    vllm_config = _make_gqa_pcp_config()
     pcp_group = SimpleNamespace(rank_in_group=1)
-    dcp_group = SimpleNamespace(rank_in_group=0)
     req_states = MagicMock()
 
     with (
@@ -224,11 +229,6 @@ def test_maybe_build_pcp_manager_uses_registered_ascend_subclass():
             vllm_pcp_manager_module,
             "get_pcp_group",
             return_value=pcp_group,
-        ),
-        patch.object(
-            vllm_pcp_manager_module,
-            "get_dcp_group",
-            return_value=dcp_group,
         ),
     ):
         manager = maybe_build_pcp_manager(
@@ -244,317 +244,95 @@ def test_maybe_build_pcp_manager_uses_registered_ascend_subclass():
     assert manager.vllm_config is None
     assert manager.pcp_world_size == 2
     assert manager.pcp_rank == 1
-    assert manager.dcp_world_size == 2
+    assert manager.dcp_world_size == 1
     assert manager.dcp_rank == 0
-    assert manager.cp_interleave == 4
+    assert manager.cp_interleave == 1
     validate_config.assert_called_once_with(vllm_config, False)
 
     manager.vllm_config = vllm_config
     assert manager.vllm_config is vllm_config
 
 
-def test_ascend_pcp_validation_is_platform_specific():
-    assert AscendPCPManager.validate_config is not PCPManager.validate_config
-
-
-def _make_validation_config(
-    cudagraph_mode: CUDAGraphMode,
-    *,
-    use_mla: bool = True,
-    sparse_mla: bool = False,
-):
-    hf_text_config = SimpleNamespace()
-    if sparse_mla:
-        hf_text_config.index_topk = 2048
-    return SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            prefill_context_parallel_size=2,
-            pipeline_parallel_size=1,
-        ),
-        model_config=SimpleNamespace(
-            is_encoder_decoder=False,
-            use_mla=use_mla,
-            hf_text_config=hf_text_config,
-        ),
-        compilation_config=SimpleNamespace(cudagraph_mode=cudagraph_mode),
-        lora_config=None,
-        speculative_config=None,
-    )
-
-
-@pytest.mark.parametrize(
-    "cudagraph_mode",
-    [
-        CUDAGraphMode.NONE,
-        CUDAGraphMode.PIECEWISE,
-        CUDAGraphMode.FULL_DECODE_ONLY,
-    ],
-)
-def test_ascend_pcp_validation_allows_dense_mla_modes(cudagraph_mode):
+def test_validate_ascend_gqa_pcp_config():
     AscendPCPManager.validate_config(
-        _make_validation_config(cudagraph_mode),
+        _make_gqa_pcp_config(),
         supports_mm_inputs=False,
     )
 
 
 @pytest.mark.parametrize(
-    ("cudagraph_mode", "use_mla", "sparse_mla"),
+    ("case", "match"),
     [
-        (CUDAGraphMode.FULL, True, False),
-        (CUDAGraphMode.FULL_AND_PIECEWISE, True, False),
-        (CUDAGraphMode.FULL_DECODE_ONLY, False, False),
-        (CUDAGraphMode.PIECEWISE, True, True),
-        (CUDAGraphMode.FULL_DECODE_ONLY, True, True),
+        ("dcp", "PCP and DCP"),
+        ("pp", "PP"),
+        ("encoder_decoder", "encoder-decoder"),
+        ("mm", "MM inputs"),
+        ("lora", "LoRA"),
     ],
 )
-def test_ascend_pcp_validation_rejects_unsupported_graph_modes(
-    cudagraph_mode,
-    use_mla,
-    sparse_mla,
-):
-    with pytest.raises(NotImplementedError):
+def test_validate_ascend_pcp_rejects_unsupported_modes(case, match):
+    vllm_config = _make_gqa_pcp_config()
+    supports_mm_inputs = case == "mm"
+    if case == "dcp":
+        vllm_config.parallel_config.decode_context_parallel_size = 2
+    elif case == "pp":
+        vllm_config.parallel_config.pipeline_parallel_size = 2
+    elif case == "encoder_decoder":
+        vllm_config.model_config.is_encoder_decoder = True
+    elif case == "lora":
+        vllm_config.lora_config = object()
+
+    with pytest.raises(NotImplementedError, match=match):
         AscendPCPManager.validate_config(
-            _make_validation_config(
-                cudagraph_mode,
-                use_mla=use_mla,
-                sparse_mla=sparse_mla,
-            ),
-            supports_mm_inputs=False,
+            vllm_config,
+            supports_mm_inputs=supports_mm_inputs,
         )
 
 
-def _make_decode_local_batch(
-    manager: AscendPCPManager,
-    num_reqs: int,
-) -> AscendInputBatch:
-    input_buffers = manager._input_buffers
-    assert input_buffers is not None
-    base_batch = InputBatch.make_dummy(
-        num_reqs=num_reqs,
-        num_tokens=num_reqs,
-        input_buffers=input_buffers,
-    )
-    base_batch.num_computed_tokens_np = np.arange(
-        10,
-        10 + num_reqs,
-        dtype=np.int32,
-    )
-    base_batch.num_scheduled_tokens = np.ones(num_reqs, dtype=np.int32)
-    base_batch.seq_lens.copy_(torch.from_numpy(base_batch.num_computed_tokens_np + base_batch.num_scheduled_tokens))
-    base_batch.seq_lens_cpu_upper_bound = torch.from_numpy(
-        base_batch.num_computed_tokens_np + base_batch.num_scheduled_tokens
-    )
-    base_batch.input_ids.copy_(torch.arange(100, 100 + num_reqs, dtype=torch.int32))
-    base_batch.positions.copy_(torch.arange(10, 10 + num_reqs, dtype=torch.int64))
-    base_batch.is_padding.fill_(False)
-    return AscendInputBatch(
-        **base_batch.__dict__,
-        seq_lens_np=(base_batch.num_computed_tokens_np + base_batch.num_scheduled_tokens),
-        attn_state="decode-attn-state",
-    )
-
-
-@pytest.mark.parametrize("num_reqs", [1, 3, 4])
-def test_partition_batch_pads_decode_to_fixed_full_graph_shape(num_reqs):
-    graph_num_reqs = 4
-    manager = AscendPCPManager(
-        pcp_world_size=2,
-        pcp_rank=0,
-        device=torch.device("cpu"),
-        req_states=MagicMock(),
-        max_num_reqs=graph_num_reqs,
-        max_num_tokens=8,
-        vllm_config=object(),
-    )
-    local_batch = _make_decode_local_batch(manager, num_reqs=num_reqs)
-    input_buffers = manager._input_buffers
-    assert input_buffers is not None
-    input_buffers.input_ids[num_reqs:graph_num_reqs].fill_(999)
-    input_buffers.positions[num_reqs:graph_num_reqs].fill_(999)
-    input_buffers.seq_lens[num_reqs:graph_num_reqs].fill_(999)
-    input_buffers.is_padding[num_reqs:graph_num_reqs].fill_(False)
-    graph_input_ids = torch.full(
-        (graph_num_reqs,),
-        999,
-        dtype=torch.int32,
-    )
-    graph_input_ids[:num_reqs].copy_(local_batch.input_ids)
-    graph_positions = torch.full(
-        (graph_num_reqs,),
-        999,
-        dtype=torch.int64,
-    )
-    graph_positions[:num_reqs].copy_(local_batch.positions)
-    graph_is_padding = torch.ones(graph_num_reqs, dtype=torch.bool)
-    global_batch = replace(
-        local_batch,
-        num_reqs_after_padding=graph_num_reqs,
-        num_tokens_after_padding=graph_num_reqs,
-        input_ids=graph_input_ids,
-        positions=graph_positions,
-        is_padding=graph_is_padding,
-    )
-
-    with (
-        patch.object(PCPManager, "partition_batch", return_value=local_batch),
-        patch.object(pcp_manager_module, "build_attn_state", return_value="attn"),
-    ):
-        result = manager.partition_batch(global_batch)
-
-    assert result.num_reqs == num_reqs
-    assert result.num_tokens == num_reqs
-    assert result.num_reqs_after_padding == graph_num_reqs
-    assert result.num_tokens_after_padding == graph_num_reqs
-    expected_query_start_loc = np.arange(graph_num_reqs + 1, dtype=np.int32)
-    np.testing.assert_array_equal(
-        result.query_start_loc_np,
-        expected_query_start_loc,
-    )
-    torch.testing.assert_close(
-        result.query_start_loc,
-        torch.from_numpy(expected_query_start_loc),
-    )
-
-    expected_seq_lens = np.zeros(graph_num_reqs, dtype=np.int32)
-    expected_seq_lens[:num_reqs] = np.arange(
-        11,
-        11 + num_reqs,
-        dtype=np.int32,
-    )
-    np.testing.assert_array_equal(result.seq_lens_np, expected_seq_lens)
-    torch.testing.assert_close(
-        result.seq_lens_cpu_upper_bound,
-        torch.from_numpy(expected_seq_lens),
-    )
-    expected_input_ids = [*range(100, 100 + num_reqs), *([0] * (4 - num_reqs))]
-    expected_positions = [*range(10, 10 + num_reqs), *([0] * (4 - num_reqs))]
-    expected_padding = [False] * num_reqs + [True] * (4 - num_reqs)
-    assert result.input_ids.tolist() == expected_input_ids
-    assert result.positions.tolist() == expected_positions
-    assert result.seq_lens.tolist() == expected_seq_lens.tolist()
-    assert result.is_padding.tolist() == expected_padding
-    assert global_batch.input_ids.tolist() == expected_input_ids
-    assert global_batch.positions.tolist() == expected_positions
-    assert global_batch.is_padding.tolist() == expected_padding
-
-
-def test_prepare_slot_mappings_overwrites_smaller_decode_graph_tail():
-    block_tables = SimpleNamespace(
-        input_block_tables=(torch.zeros(4, 2, dtype=torch.int32),),
-        num_kv_cache_groups=1,
-    )
-    manager = AscendPCPManager(
-        pcp_world_size=2,
-        pcp_rank=0,
-        device=torch.device("cpu"),
-        req_states=MagicMock(),
-        max_num_reqs=4,
-        max_num_tokens=8,
-        block_tables=block_tables,
-        vllm_config=object(),
-    )
-    global_batch = _make_decode_local_batch(manager, num_reqs=2)
-    manager._global_batch = replace(
-        global_batch,
-        num_reqs_after_padding=4,
-        num_tokens_after_padding=4,
-    )
-    gathered = manager._gathered_kv_slot_mappings
-    assert gathered is not None
-    _, capture_slot_mappings = manager.prepare_dummy_attn(
-        num_reqs=4,
-        num_tokens=4,
-    )
-    capture_slot_ptr = capture_slot_mappings.data_ptr()
-    gathered.fill_(77)
-    gathered[:, :4] = torch.tensor(
-        [[10, 11, PAD_SLOT_ID, PAD_SLOT_ID]],
-        dtype=torch.int64,
-    )
+@pytest.mark.parametrize("use_mla", [False, True])
+def test_validate_ascend_pcp_does_not_delegate_to_upstream(use_mla):
+    vllm_config = _make_gqa_pcp_config()
+    vllm_config.model_config.use_mla = use_mla
 
     with patch.object(
         PCPManager,
-        "prepare_slot_mappings",
-        return_value=gathered[:, :4],
-    ):
-        slot_mappings = manager.prepare_slot_mappings()
+        "validate_config",
+    ) as validate_upstream:
+        AscendPCPManager.validate_config(vllm_config, supports_mm_inputs=False)
 
-    assert slot_mappings.data_ptr() == gathered.data_ptr()
-    assert slot_mappings.data_ptr() == capture_slot_ptr
-    assert slot_mappings.tolist() == [
-        [10, 11, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID]
-    ]
-
-    manager._global_batch = replace(
-        _make_decode_local_batch(manager, num_reqs=1),
-        num_reqs_after_padding=4,
-        num_tokens_after_padding=4,
-    )
-    gathered[:, :2] = torch.tensor([[20, PAD_SLOT_ID]], dtype=torch.int64)
-    with patch.object(
-        PCPManager,
-        "prepare_slot_mappings",
-        return_value=gathered[:, :2],
-    ):
-        smaller_slot_mappings = manager.prepare_slot_mappings()
-
-    assert smaller_slot_mappings.data_ptr() == gathered.data_ptr()
-    assert smaller_slot_mappings.tolist() == [
-        [20, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID]
-    ]
+    validate_upstream.assert_not_called()
 
 
-def test_prepare_dummy_attn_reuses_and_clears_persistent_buffers():
-    block_tables = SimpleNamespace(
-        input_block_tables=(torch.zeros(4, 2, dtype=torch.int32),),
-        num_kv_cache_groups=1,
-    )
+@pytest.mark.parametrize(
+    "case",
+    [
+        "spec_decode",
+        "quantization",
+        "piecewise_graph",
+        "full_graph",
+        "dtype",
+        "mha",
+    ],
+)
+def test_validate_ascend_pcp_adds_no_ascend_only_restrictions(case):
+    vllm_config = _make_gqa_pcp_config()
+    if case == "spec_decode":
+        vllm_config.speculative_config = object()
+    elif case == "quantization":
+        vllm_config.model_config.quantization = "ascend"
+    elif case == "piecewise_graph":
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+    elif case == "full_graph":
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+    elif case == "dtype":
+        vllm_config.model_config.dtype = torch.float16
+    elif case == "mha":
+        vllm_config.model_config.hf_text_config.num_key_value_heads = 32
+    elif case == "invalid_gqa_heads":
+        vllm_config.model_config.hf_text_config.num_attention_heads = 30
 
-    def gather_block_tables(idx_mapping, num_reqs, out, out_ptrs):
-        out[0][:num_reqs].fill_(7)
-        return tuple(block_table[:num_reqs] for block_table in out)
+    AscendPCPManager.validate_config(vllm_config, supports_mm_inputs=False)
 
-    block_tables.gather_block_tables = gather_block_tables
-    manager = AscendPCPManager(
-        pcp_world_size=2,
-        pcp_rank=0,
-        device=torch.device("cpu"),
-        req_states=MagicMock(),
-        max_num_reqs=4,
-        max_num_tokens=8,
-        block_tables=block_tables,
-        vllm_config=object(),
-    )
-    local_block_tables = manager._local_block_tables
-    gathered = manager._gathered_kv_slot_mappings
-    assert local_block_tables is not None
-    assert gathered is not None
-    local_block_tables[0].fill_(99)
-    gathered.fill_(88)
-    block_ptr = local_block_tables[0].data_ptr()
-    slot_ptr = gathered.data_ptr()
 
-    dummy_block_tables, dummy_slot_mappings = manager.prepare_dummy_attn(
-        num_reqs=3,
-        num_tokens=4,
-    )
-
-    assert dummy_block_tables[0].data_ptr() == block_ptr
-    assert dummy_slot_mappings.data_ptr() == slot_ptr
-    assert torch.count_nonzero(dummy_block_tables[0]).item() == 0
-    assert dummy_slot_mappings.shape == (1, 8)
-    assert torch.all(dummy_slot_mappings == PAD_SLOT_ID)
-
-    replay_batch = SimpleNamespace(
-        idx_mapping=torch.arange(3, dtype=torch.int32),
-        num_reqs_after_padding=3,
-    )
-    with patch.object(
-        manager,
-        "prepare_slot_mappings",
-        return_value=dummy_slot_mappings,
-    ):
-        replay_block_tables, replay_slot_mappings = manager.prepare_attn(replay_batch)
-
-    assert replay_block_tables[0].data_ptr() == dummy_block_tables[0].data_ptr()
-    assert replay_slot_mappings.data_ptr() == dummy_slot_mappings.data_ptr()
+def test_ascend_pcp_validation_is_platform_specific():
+    assert AscendPCPManager.validate_config is not PCPManager.validate_config

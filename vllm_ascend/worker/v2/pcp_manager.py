@@ -141,14 +141,11 @@ class AscendPCPManager(PCPManager):
         input_buffers.is_padding[:num_tokens].fill_(False)
         input_buffers.is_padding[num_tokens:graph_num_tokens].fill_(True)
 
-        query_start_loc_np = np.empty(graph_num_reqs + 1, dtype=np.int32)
-        query_start_loc_np[: num_reqs + 1] = local_batch.query_start_loc_np
-        query_start_loc_np[num_reqs + 1 :] = num_tokens + np.arange(
-            1,
-            num_padding_reqs + 1,
-            dtype=np.int32,
-        )
-        async_copy_to_gpu(query_start_loc_np, out=input_buffers.query_start_loc)
+        query_start_loc_buffer_np = np.full(input_buffers.max_num_reqs + 1, graph_num_tokens, dtype=np.int32)
+        query_start_loc_buffer_np[: num_reqs + 1] = local_batch.query_start_loc_np
+        query_start_loc_buffer_np[num_reqs + 1 : graph_num_reqs + 1] = num_tokens + np.arange(1, num_padding_reqs + 1, dtype=np.int32)
+        async_copy_to_gpu(query_start_loc_buffer_np, out=input_buffers.query_start_loc)
+        query_start_loc_np = query_start_loc_buffer_np[: graph_num_reqs + 1]
 
         padded_seq_lens_np = np.zeros(graph_num_reqs, dtype=np.int32)
         padded_seq_lens_np[:num_reqs] = local_seq_lens_np
