@@ -83,6 +83,7 @@ def test_update_full_graph_params_dispatches_draft_metadata_by_keyword():
 
 def test_prepare_pcp_inputs_to_capture_uses_partitioned_persistent_buffers():
     events = []
+    capture_attn_state = object()
     input_buffers = AscendInputBuffers(
         max_num_reqs=4,
         max_num_tokens=8,
@@ -91,6 +92,7 @@ def test_prepare_pcp_inputs_to_capture_uses_partitioned_persistent_buffers():
     input_batch = SimpleNamespace(
         num_reqs_after_padding=4,
         num_tokens_after_padding=4,
+        attn_state=capture_attn_state,
     )
     block_table = torch.zeros(4, 2, dtype=torch.int32)
     slot_mapping = torch.arange(8, dtype=torch.int64).view(1, 8)
@@ -103,6 +105,7 @@ def test_prepare_pcp_inputs_to_capture_uses_partitioned_persistent_buffers():
     def partition_batch(batch):
         events.append("partition")
         assert batch is input_batch
+        batch.attn_state = object()
         return input_batch
 
     def prepare_dummy_attn(num_reqs, num_tokens):
@@ -144,6 +147,7 @@ def test_prepare_pcp_inputs_to_capture_uses_partitioned_persistent_buffers():
     assert events == ["partition", "dummy_attn", "metadata"]
     make_dummy.assert_called_once_with(4, 4, input_buffers)
     assert model_state.prepare_attn.call_args.args[0] is input_batch
+    assert input_batch.attn_state is capture_attn_state
     assert model_state.prepare_attn.call_args.args[1] == CUDAGraphMode.NONE
     assert model_state.prepare_attn.call_args.args[2][0].data_ptr() == (block_table.data_ptr())
     assert model_state.prepare_attn.call_args.args[3].data_ptr() == (slot_mapping.data_ptr())
