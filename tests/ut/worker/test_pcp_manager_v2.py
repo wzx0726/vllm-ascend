@@ -467,6 +467,71 @@ def test_partition_batch_pads_decode_to_fixed_full_graph_shape(num_reqs):
     assert global_batch.is_padding.tolist() == expected_padding
 
 
+def test_pad_decode_batch_supports_single_fia_dummy_request():
+    """Allow one FIA dummy request to consume multiple padding tokens."""
+    num_reqs = 2
+    graph_num_reqs = 3
+    graph_num_tokens = 4
+    manager = AscendPCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        req_states=MagicMock(),
+        max_num_reqs=graph_num_reqs,
+        max_num_tokens=graph_num_tokens,
+        vllm_config=object(),
+    )
+    local_batch = _make_decode_local_batch(manager, num_reqs=num_reqs)
+    input_buffers = manager._input_buffers
+    assert input_buffers is not None
+    input_buffers.input_ids[num_reqs:graph_num_tokens].fill_(999)
+    input_buffers.positions[num_reqs:graph_num_tokens].fill_(999)
+    input_buffers.seq_lens[num_reqs:graph_num_reqs].fill_(999)
+    input_buffers.is_padding[num_reqs:graph_num_tokens].fill_(False)
+
+    graph_input_ids = torch.full(
+        (graph_num_tokens,),
+        999,
+        dtype=torch.int32,
+    )
+    graph_input_ids[:num_reqs].copy_(local_batch.input_ids)
+    graph_positions = torch.full(
+        (graph_num_tokens,),
+        999,
+        dtype=torch.int64,
+    )
+    graph_positions[:num_reqs].copy_(local_batch.positions)
+    manager._global_batch = replace(
+        local_batch,
+        num_reqs_after_padding=graph_num_reqs,
+        num_tokens_after_padding=graph_num_tokens,
+        input_ids=graph_input_ids,
+        positions=graph_positions,
+        is_padding=torch.ones(graph_num_tokens, dtype=torch.bool),
+    )
+
+    result = manager._pad_decode_batch_for_full_graph(
+        local_batch,
+        graph_num_reqs,
+        graph_num_tokens,
+        local_batch.seq_lens_np,
+    )
+
+    expected_query_start_loc = np.array([0, 1, 2, 4], dtype=np.int32)
+    np.testing.assert_array_equal(
+        result.query_start_loc_np,
+        expected_query_start_loc,
+    )
+    torch.testing.assert_close(
+        result.query_start_loc,
+        torch.from_numpy(expected_query_start_loc),
+    )
+    assert result.input_ids.tolist() == [100, 101, 0, 0]
+    assert result.positions.tolist() == [10, 11, 0, 0]
+    assert result.seq_lens.tolist() == [11, 12, 0]
+    assert result.is_padding.tolist() == [False, False, True, True]
+
+
 def test_prepare_slot_mappings_overwrites_smaller_decode_graph_tail():
     block_tables = SimpleNamespace(
         input_block_tables=(torch.zeros(4, 2, dtype=torch.int32),),

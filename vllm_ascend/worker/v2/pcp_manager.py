@@ -101,9 +101,14 @@ class AscendPCPManager(PCPManager):
 
         num_padding_reqs = graph_num_reqs - num_reqs
         num_padding_tokens = graph_num_tokens - num_tokens
-        if num_padding_reqs != num_padding_tokens:
+        uses_per_request_padding = num_padding_reqs == num_padding_tokens
+        uses_single_fia_dummy = (
+            num_padding_reqs == 1 and num_padding_tokens > 0
+        )
+        if not (uses_per_request_padding or uses_single_fia_dummy):
             raise RuntimeError(
-                "PCP FULL_DECODE_ONLY requires one token per padded request: "
+                "PCP FULL_DECODE_ONLY requires either one token per padded "
+                "request or one FIA dummy request for all padding tokens: "
                 f"{num_padding_tokens} tokens for {num_padding_reqs} requests."
             )
 
@@ -141,12 +146,30 @@ class AscendPCPManager(PCPManager):
         input_buffers.is_padding[:num_tokens].fill_(False)
         input_buffers.is_padding[num_tokens:graph_num_tokens].fill_(True)
 
-        query_start_loc_buffer_np = np.full(input_buffers.max_num_reqs + 1, graph_num_tokens, dtype=np.int32)
-        query_start_loc_buffer_np[: num_reqs + 1] = local_batch.query_start_loc_np
-        query_start_loc_buffer_np[num_reqs + 1 : graph_num_reqs + 1] = num_tokens + np.arange(
-            1, num_padding_reqs + 1, dtype=np.int32
+        query_start_loc_buffer_np = np.full(
+            input_buffers.max_num_reqs + 1,
+            graph_num_tokens,
+            dtype=np.int32,
         )
-        async_copy_to_gpu(query_start_loc_buffer_np, out=input_buffers.query_start_loc)
+        query_start_loc_buffer_np[: num_reqs + 1] = (
+            local_batch.query_start_loc_np
+        )
+        if uses_per_request_padding:
+            query_start_loc_buffer_np[
+                num_reqs + 1 : graph_num_reqs + 1
+            ] = num_tokens + np.arange(
+                1,
+                num_padding_reqs + 1,
+                dtype=np.int32,
+            )
+        else:
+            query_start_loc_buffer_np[
+                num_reqs + 1 : graph_num_reqs + 1
+            ] = graph_num_tokens
+        async_copy_to_gpu(
+            query_start_loc_buffer_np,
+            out=input_buffers.query_start_loc,
+        )
         query_start_loc_np = query_start_loc_buffer_np[: graph_num_reqs + 1]
 
         padded_seq_lens_np = np.zeros(graph_num_reqs, dtype=np.int32)
