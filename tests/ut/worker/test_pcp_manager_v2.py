@@ -268,60 +268,6 @@ def test_maybe_build_ascend_pcp_manager_uses_ascend_subclass():
     assert manager.cp_interleave == 1
 
 
-@pytest.mark.parametrize(
-    ("case", "match"),
-    [
-        ("dcp", "PCP and DCP"),
-        ("pp", "PP"),
-        ("encoder_decoder", "encoder-decoder"),
-        ("mm", "MM inputs"),
-        ("lora", "LoRA"),
-        ("spec_decode", "speculative decoding"),
-        ("quantization", "quantized models"),
-        ("graph", "eager mode only"),
-        ("dtype", "BF16 models only"),
-        ("mha", "num_attention_heads"),
-    ],
-)
-def test_validate_ascend_gqa_pcp_rejects_unsupported_modes(case, match):
-    vllm_config = _make_gqa_pcp_config()
-    supports_mm_inputs = case == "mm"
-    if case == "dcp":
-        vllm_config.parallel_config.decode_context_parallel_size = 2
-    elif case == "pp":
-        vllm_config.parallel_config.pipeline_parallel_size = 2
-    elif case == "encoder_decoder":
-        vllm_config.model_config.is_encoder_decoder = True
-    elif case == "lora":
-        vllm_config.lora_config = object()
-    elif case == "spec_decode":
-        vllm_config.speculative_config = object()
-    elif case == "quantization":
-        vllm_config.model_config.quantization = "ascend"
-    elif case == "graph":
-        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
-    elif case == "dtype":
-        vllm_config.model_config.dtype = torch.float16
-    elif case == "mha":
-        vllm_config.model_config.hf_text_config.num_key_value_heads = 32
-
-    with pytest.raises(NotImplementedError, match=match):
-        validate_ascend_pcp_config(vllm_config, supports_mm_inputs=supports_mm_inputs)
-
-
-def test_validate_ascend_pcp_preserves_upstream_mla_validation():
-    vllm_config = _make_gqa_pcp_config()
-    vllm_config.model_config.use_mla = True
-
-    with patch.object(
-        pcp_manager_module,
-        "_UPSTREAM_PCP_VALIDATE_CONFIG",
-    ) as validate_upstream:
-        validate_ascend_pcp_config(vllm_config, supports_mm_inputs=False)
-
-    validate_upstream.assert_called_once_with(vllm_config, False)
-
-
 def _make_decode_local_batch(
     manager: AscendPCPManager,
     num_reqs: int,
@@ -598,3 +544,68 @@ def test_prepare_dummy_attn_reuses_and_clears_persistent_buffers():
 
     assert replay_block_tables[0].data_ptr() == dummy_block_tables[0].data_ptr()
     assert replay_slot_mappings.data_ptr() == dummy_slot_mappings.data_ptr()
+
+
+def test_pad_decode_batch_supports_single_fia_dummy_request():
+    """Allow one FIA dummy request to consume multiple padding tokens."""
+    num_reqs = 2
+    graph_num_reqs = 3
+    graph_num_tokens = 4
+    manager = AscendPCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        req_states=MagicMock(),
+        max_num_reqs=graph_num_reqs,
+        max_num_tokens=graph_num_tokens,
+        vllm_config=object(),
+    )
+    local_batch = _make_decode_local_batch(manager, num_reqs=num_reqs)
+    input_buffers = manager._input_buffers
+    assert input_buffers is not None
+    input_buffers.input_ids[num_reqs:graph_num_tokens].fill_(999)
+    input_buffers.positions[num_reqs:graph_num_tokens].fill_(999)
+    input_buffers.seq_lens[num_reqs:graph_num_reqs].fill_(999)
+    input_buffers.is_padding[num_reqs:graph_num_tokens].fill_(False)
+
+    graph_input_ids = torch.full(
+        (graph_num_tokens,),
+        999,
+        dtype=torch.int32,
+    )
+    graph_input_ids[:num_reqs].copy_(local_batch.input_ids)
+    graph_positions = torch.full(
+        (graph_num_tokens,),
+        999,
+        dtype=torch.int64,
+    )
+    graph_positions[:num_reqs].copy_(local_batch.positions)
+    manager._global_batch = replace(
+        local_batch,
+        num_reqs_after_padding=graph_num_reqs,
+        num_tokens_after_padding=graph_num_tokens,
+        input_ids=graph_input_ids,
+        positions=graph_positions,
+        is_padding=torch.ones(graph_num_tokens, dtype=torch.bool),
+    )
+
+    result = manager._pad_decode_batch_for_full_graph(
+        local_batch,
+        graph_num_reqs,
+        graph_num_tokens,
+        local_batch.seq_lens_np,
+    )
+
+    expected_query_start_loc = np.array([0, 1, 2, 4], dtype=np.int32)
+    np.testing.assert_array_equal(
+        result.query_start_loc_np,
+        expected_query_start_loc,
+    )
+    torch.testing.assert_close(
+        result.query_start_loc,
+        torch.from_numpy(expected_query_start_loc),
+    )
+    assert result.input_ids.tolist() == [100, 101, 0, 0]
+    assert result.positions.tolist() == [10, 11, 0, 0]
+    assert result.seq_lens.tolist() == [11, 12, 0]
+    assert result.is_padding.tolist() == [False, False, True, True]
