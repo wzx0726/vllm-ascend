@@ -267,6 +267,16 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         )
 
         scheduler_config = vllm_config.scheduler_config
+        parallel_config = vllm_config.parallel_config
+
+        pcp_enabled = parallel_config.prefill_context_parallel_size > 1
+        dcp_enabled = parallel_config.decode_context_parallel_size > 1
+
+        # 普通 MLA 可以按长度把 short extend 当作 decode；
+        # PCP/DCP 下必须结合 is_prefilling 判断真实请求类型。
+        self.treat_short_extends_as_decodes = not (
+            pcp_enabled or dcp_enabled
+        )
         self.block_size = vllm_config.cache_config.block_size
         self.max_blocks = (vllm_config.model_config.max_model_len + self.block_size - 1) // self.block_size
         self.chunked_prefill_enabled = scheduler_config.enable_chunked_prefill
@@ -452,7 +462,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=self.decode_threshold,
-                treat_short_extends_as_decodes=common_attn_metadata.context_parallel_metadata is None,
+                treat_short_extends_as_decodes=self.treat_short_extends_as_decodes,
             )
         )
         self.set_num_actual_tokens(common_attn_metadata)

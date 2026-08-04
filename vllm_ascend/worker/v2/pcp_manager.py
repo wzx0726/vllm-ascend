@@ -25,6 +25,7 @@ from vllm.config import VllmConfig
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.pcp_manager import PCPManager, PCPManagerRegistry
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
@@ -64,14 +65,15 @@ class AscendPCPManager(PCPManager):
         assert isinstance(local_batch, AscendInputBatch)
 
         local_seq_lens_np = local_batch.num_computed_tokens_np + local_batch.num_scheduled_tokens
-        local_batch.attn_state = build_attn_state(
-            self.vllm_config,
-            local_seq_lens_np,
-            local_batch.num_reqs,
-            local_batch.num_scheduled_tokens,
-            local_batch.num_scheduled_tokens,
-        )
         if is_decode_only:
+            # PCP partitioning must not change the semantic attention state of
+            # a decode-only batch. In particular, dummy sequence lengths used
+            # for full-decode graph capture look like a fresh prefill to
+            # build_attn_state(), even though make_dummy() selected decode.
+            local_batch.attn_state = input_batch.attn_state
+            if local_batch.attn_state is None:
+                local_batch.attn_state = AscendAttentionState.DecodeOnly
+
             return self._pad_decode_batch_for_full_graph(
                 local_batch,
                 graph_num_reqs,
@@ -79,6 +81,13 @@ class AscendPCPManager(PCPManager):
                 local_seq_lens_np,
             )
 
+        local_batch.attn_state = build_attn_state(
+            self.vllm_config,
+            local_seq_lens_np,
+            local_batch.num_reqs,
+            local_batch.num_scheduled_tokens,
+            local_batch.num_scheduled_tokens,
+        )
         local_batch.seq_lens_np = local_seq_lens_np
         return local_batch
 
