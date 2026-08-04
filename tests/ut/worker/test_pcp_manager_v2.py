@@ -394,6 +394,7 @@ def test_partition_batch_pads_decode_to_fixed_full_graph_shape(num_reqs):
         dtype=torch.int64,
     )
     graph_positions[:num_reqs].copy_(local_batch.positions)
+    source_attn_state = None if num_reqs == 1 else "decode-attn-state"
     global_batch = replace(
         local_batch,
         num_reqs_after_padding=graph_num_reqs,
@@ -401,6 +402,7 @@ def test_partition_batch_pads_decode_to_fixed_full_graph_shape(num_reqs):
         input_ids=graph_input_ids,
         positions=graph_positions,
         is_padding=torch.ones(graph_num_reqs, dtype=torch.bool),
+        attn_state=source_attn_state,
     )
 
     def partition_batch(input_batch):
@@ -417,10 +419,17 @@ def test_partition_batch_pads_decode_to_fixed_full_graph_shape(num_reqs):
             pcp_manager_module,
             "build_attn_state",
             return_value="attn",
-        ),
+        ) as build_attn_state,
     ):
         result = manager.partition_batch(global_batch)
 
+    expected_attn_state = (
+        pcp_manager_module.AscendAttentionState.DecodeOnly
+        if source_attn_state is None
+        else source_attn_state
+    )
+    assert result.attn_state == expected_attn_state
+    build_attn_state.assert_not_called()
     assert result.num_reqs == num_reqs
     assert result.num_tokens == num_reqs
     assert result.num_reqs_after_padding == graph_num_reqs

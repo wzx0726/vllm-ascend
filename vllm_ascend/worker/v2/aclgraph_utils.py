@@ -76,12 +76,7 @@ def _prepare_pcp_inputs_to_capture(
         num_tokens,
         input_buffers,
     )
-
-    # PCP partitioning rebuilds the attention state from dummy sequence lengths.
-    # Preserve the decode state selected for full-decode graph capture.
-    capture_attn_state = input_batch.attn_state
     input_batch = pcp_manager.partition_batch(input_batch)
-    input_batch.attn_state = capture_attn_state
     input_block_tables, slot_mappings = pcp_manager.prepare_dummy_attn(
         input_batch.num_reqs_after_padding,
         input_batch.num_tokens_after_padding,
