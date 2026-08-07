@@ -125,6 +125,7 @@ class AscendPCPManager(PCPManager):
         # buffers, while PCP attention metadata uses the rank-local buffers.
         # Clear both views so a smaller replay cannot observe stale padding
         # left by a previously larger decode batch.
+        # Clear the full image buffer to prevent dirty data from polluting the next image.
         global_batch = self._global_batch
         assert global_batch is not None
         global_batch.input_ids[num_tokens:graph_num_tokens].zero_()

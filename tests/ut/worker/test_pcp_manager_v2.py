@@ -212,11 +212,91 @@ def test_partition_batch_refreshes_local_ascend_input_batch_metadata():
     np.testing.assert_array_equal(args[4], np.array([3, 5], dtype=np.int32))
 
 
-def test_ascend_pcp_manager_is_registered():
-    assert (
-        PCPManagerRegistry.get_manager_class(ASCEND_PCP_MANAGER_NAME)
-        is AscendPCPManager
+def test_cached_prefill_partitions_only_the_scheduled_suffix() -> None:
+    manager = AscendPCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        req_states=MagicMock(),
+        max_num_reqs=4,
+        max_num_tokens=8,
+        vllm_config=object(),
     )
+
+    def local_starts(num_computed_tokens: int) -> list[int]:
+        segments = manager._get_rank_segments(
+            rank=0,
+            num_scheduled_tokens=np.array([8], dtype=np.int32),
+            num_computed_tokens=np.array([num_computed_tokens], dtype=np.int32),
+            is_prefilling=np.array([True]),
+            query_start_loc_np=np.array([0, 8], dtype=np.int32),
+        )
+        return [num_computed_tokens + segment.global_batch_slice.start for segment in segments]
+
+    # Two scheduler iterations of one longer suffix advance from the cached
+    # prefix without repartitioning or recomputing that prefix.
+    assert local_starts(128) == [128, 134]
+    assert local_starts(136) == [136, 142]
+
+
+def test_pcp_layout_orders_cache_hit_miss_and_decode_rows() -> None:
+    manager = AscendPCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        req_states=MagicMock(),
+        max_num_reqs=8,
+        max_num_tokens=8,
+        vllm_config=object(),
+    )
+    num_scheduled_tokens = np.array([1, 4, 1], dtype=np.int32)
+    num_computed_tokens = np.array([128, 0, 256], dtype=np.int32)
+    is_prefilling = np.array([True, True, False])
+    query_start_loc = np.array([0, 1, 5, 6], dtype=np.int32)
+
+    rank_zero = manager._get_rank_segments(
+        0,
+        num_scheduled_tokens,
+        num_computed_tokens,
+        is_prefilling,
+        query_start_loc,
+    )
+    rank_one = manager._get_rank_segments(
+        1,
+        num_scheduled_tokens,
+        num_computed_tokens,
+        is_prefilling,
+        query_start_loc,
+    )
+
+    def layout(segments):
+        return [
+            (
+                segment.global_batch_req_idx,
+                segment.global_batch_slice.start,
+                segment.global_batch_slice.stop,
+            )
+            for segment in segments
+        ]
+
+    # Continued prefills and replicated decodes stay before fresh prefills.
+    # The one-token cache-hit suffix is owned by rank 0; no cached prefix token
+    # appears in either rank's scheduled slices.
+    assert layout(rank_zero) == [
+        (0, 0, 1),
+        (2, 5, 6),
+        (1, 1, 2),
+        (1, 4, 5),
+    ]
+    assert layout(rank_one) == [
+        (2, 5, 6),
+        (1, 2, 3),
+        (1, 3, 4),
+    ]
+
+
+def test_ascend_pcp_manager_is_registered():
+    assert PCPManagerRegistry.get_manager_class(ASCEND_PCP_MANAGER_NAME) is AscendPCPManager
 
 
 def test_maybe_build_pcp_manager_uses_registered_ascend_subclass():
@@ -356,18 +436,11 @@ def _make_decode_local_batch(
         dtype=np.int32,
     )
     base_batch.num_scheduled_tokens = np.ones(num_reqs, dtype=np.int32)
-    seq_lens = (
-        base_batch.num_computed_tokens_np
-        + base_batch.num_scheduled_tokens
-    )
+    seq_lens = base_batch.num_computed_tokens_np + base_batch.num_scheduled_tokens
     base_batch.seq_lens.copy_(torch.from_numpy(seq_lens))
     base_batch.seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens)
-    base_batch.input_ids.copy_(
-        torch.arange(100, 100 + num_reqs, dtype=torch.int32)
-    )
-    base_batch.positions.copy_(
-        torch.arange(10, 10 + num_reqs, dtype=torch.int64)
-    )
+    base_batch.input_ids.copy_(torch.arange(100, 100 + num_reqs, dtype=torch.int32))
+    base_batch.positions.copy_(torch.arange(10, 10 + num_reqs, dtype=torch.int64))
     base_batch.is_padding.fill_(False)
     return AscendInputBatch(
         **base_batch.__dict__,
