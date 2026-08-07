@@ -10,6 +10,9 @@ import torch
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackendImpl,
     AscendAttentionMetadataBuilder,
+    AscendAttentionPCPImpl,
+    AscendAttentionPCPMetadata,
+    AscendAttentionPCPMetadataBuilder,
     AscendAttentionState,
     AscendC8AttentionBackendImpl,
     AscendMetadata,
@@ -18,9 +21,6 @@ from vllm_ascend.attention.context_parallel.attention_cp import (
     AscendAttentionDCPImpl,
     AscendAttentionDCPMetadata,
     AscendAttentionDCPMetadataBuilder,
-    AscendAttentionPCPImpl,
-    AscendAttentionPCPMetadata,
-    AscendAttentionPCPMetadataBuilder,
     AscendMetadataForDecode,
 )
 from vllm_ascend.attention.context_parallel.common_cp import (
@@ -191,11 +191,9 @@ def test_pcp_cache_gather_keeps_one_decode_and_all_padded_prefills() -> None:
             "vllm.model_executor.layers.attention.pcp.get_pcp_group",
             return_value=pcp_group,
         ),
-        patch(
-            "vllm_ascend.attention.context_parallel.attention_cp.DeviceOperator.reshape_and_cache"
-        ) as reshape_and_cache,
-        patch("vllm_ascend.attention.context_parallel.attention_cp.logger.info_once") as info_once,
-        patch("vllm_ascend.attention.context_parallel.attention_cp.notify_kv_cache_written") as notify_cache_written,
+        patch("vllm_ascend.attention.attention_v1.DeviceOperator.reshape_and_cache") as reshape_and_cache,
+        patch("vllm_ascend.attention.attention_v1.logger.info_once") as info_once,
+        patch("vllm_ascend.attention.attention_v1.notify_kv_cache_written") as notify_cache_written,
     ):
         result = impl.reshape_and_cache(
             query,
@@ -258,10 +256,8 @@ def test_pcp_cache_gather_pure_prefill_odd_length_with_padding() -> None:
             "vllm.model_executor.layers.attention.pcp.get_pcp_group",
             return_value=pcp_group,
         ),
-        patch(
-            "vllm_ascend.attention.context_parallel.attention_cp.DeviceOperator.reshape_and_cache"
-        ) as reshape_and_cache,
-        patch("vllm_ascend.attention.context_parallel.attention_cp.notify_kv_cache_written") as notify_cache_written,
+        patch("vllm_ascend.attention.attention_v1.DeviceOperator.reshape_and_cache") as reshape_and_cache,
+        patch("vllm_ascend.attention.attention_v1.notify_kv_cache_written") as notify_cache_written,
     ):
         impl.reshape_and_cache(
             query,
@@ -366,10 +362,8 @@ def test_pcp_decode_only_does_not_all_gather_kv() -> None:
 
     with (
         patch("vllm.model_executor.layers.attention.pcp.get_pcp_group") as get_pcp_group,
-        patch(
-            "vllm_ascend.attention.context_parallel.attention_cp.DeviceOperator.reshape_and_cache"
-        ) as reshape_and_cache,
-        patch("vllm_ascend.attention.context_parallel.attention_cp.notify_kv_cache_written"),
+        patch("vllm_ascend.attention.attention_v1.DeviceOperator.reshape_and_cache") as reshape_and_cache,
+        patch("vllm_ascend.attention.attention_v1.notify_kv_cache_written"),
     ):
         impl.reshape_and_cache(
             query,
@@ -433,9 +427,7 @@ def test_dcp_partial_attention_merge_matches_weighted_reference() -> None:
 
 
 def test_pcp_builder_keeps_short_extend_in_prefill() -> None:
-    builder = AscendAttentionPCPMetadataBuilder.__new__(
-        AscendAttentionPCPMetadataBuilder
-    )
+    builder = AscendAttentionPCPMetadataBuilder.__new__(AscendAttentionPCPMetadataBuilder)
     builder.decode_threshold = 1
     common_metadata = SimpleNamespace(
         context_parallel_metadata=None,

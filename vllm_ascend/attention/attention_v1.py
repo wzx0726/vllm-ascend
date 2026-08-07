@@ -24,6 +24,9 @@ import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from vllm.distributed.parallel_state import get_pcp_group
+from vllm.logger import logger
+from vllm.model_executor.layers.attention.pcp import _gather_prefill_cache_inputs
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionBackend,
@@ -88,8 +91,6 @@ class AscendAttentionBackend(AttentionBackend):
         if pcp_enabled and dcp_enabled:
             raise NotImplementedError("Ascend MRV2 GQA does not support PCP and DCP simultaneously yet.")
         if pcp_enabled:
-            from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionPCPImpl
-
             return AscendAttentionPCPImpl
         if dcp_enabled:
             from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionDCPImpl
@@ -104,8 +105,6 @@ class AscendAttentionBackend(AttentionBackend):
         if pcp_enabled and dcp_enabled:
             raise NotImplementedError("Ascend MRV2 GQA does not support PCP and DCP simultaneously yet.")
         if pcp_enabled:
-            from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionPCPMetadataBuilder
-
             return AscendAttentionPCPMetadataBuilder
         if dcp_enabled:
             from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionDCPMetadataBuilder
@@ -216,6 +215,14 @@ class AscendMetadata:
     model_runner_type: str = ""
     # prefill reshape_and_cache event
     reshape_cache_event: torch.npu.Event = None
+
+
+@dataclass
+class AscendAttentionPCPMetadata(AscendMetadata):
+    """GQA metadata needed to write the complete PCP KV cache."""
+
+    pcp_slot_mapping: torch.Tensor | None = None
+    pcp_local_num_input_tokens: int = 0
 
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
@@ -410,6 +417,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             **backend_metadata,
         )
         return attn_metadata
+
     # TODO 修改函数名称，作为上游的重写
     def build_for_graph_capture(
         self,
@@ -432,6 +440,77 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
 
         attn_metadata.attn_state = attn_state
         return attn_metadata
+
+
+class AscendAttentionPCPMetadataBuilder(AscendAttentionMetadataBuilder):
+    """Build rank-local GQA metadata while retaining expanded cache slots."""
+
+    metadata_cls = AscendAttentionPCPMetadata
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
+        self.pcp_rank = get_pcp_group().rank_in_group
+
+    def _split_decodes_and_prefills(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+    ) -> tuple[int, int, int, int]:
+        return split_decodes_and_prefills(
+            common_attn_metadata,
+            decode_threshold=self.decode_threshold,
+            treat_short_extends_as_decodes=False,
+        )
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> AscendAttentionPCPMetadata:
+        expanded_slot_mapping = common_attn_metadata.slot_mapping
+        metadata = super().build(
+            common_prefix_len,
+            common_attn_metadata,
+            fast_build,
+        )
+        assert isinstance(metadata, AscendAttentionPCPMetadata)
+        if expanded_slot_mapping.numel() % self.pcp_size != 0:
+            raise RuntimeError(
+                "PCP slot mapping size must be divisible by the PCP world size: "
+                f"{expanded_slot_mapping.numel()} % {self.pcp_size} != 0."
+            )
+
+        local_num_input_tokens = expanded_slot_mapping.numel() // self.pcp_size
+        if metadata.num_actual_tokens > local_num_input_tokens:
+            raise RuntimeError(
+                "PCP actual token count exceeds the rank-local padded token count: "
+                f"{metadata.num_actual_tokens} > {local_num_input_tokens}."
+            )
+
+        rank_slot_mappings = expanded_slot_mapping.view(
+            self.pcp_size,
+            local_num_input_tokens,
+        )
+        num_decode_tokens = metadata.num_decode_tokens
+        metadata.slot_mapping = torch.cat(
+            (
+                rank_slot_mappings[0, :num_decode_tokens],
+                rank_slot_mappings[
+                    self.pcp_rank,
+                    num_decode_tokens : metadata.num_actual_tokens,
+                ],
+            )
+        )
+        metadata.pcp_slot_mapping = expanded_slot_mapping
+        metadata.pcp_local_num_input_tokens = local_num_input_tokens
+        # PCP always executes prefill tokens through the chunked-prefill path,
+        # including a one-token suffix left by a prefix-cache hit. The generic
+        # state builder classifies an all-one-token batch as decode-only, while
+        # the PCP-aware split above correctly keeps such tokens in prefill.
+        if metadata.num_prefills > 0:
+            metadata.attn_state = AscendAttentionState.ChunkedPrefill
+        return metadata
 
 
 class AscendAttentionBackendImpl(AttentionImpl):
@@ -1615,6 +1694,64 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
         output[:num_tokens] = attn_output[:num_tokens]
         return output
+
+
+class AscendAttentionPCPImpl(AscendAttentionBackendImpl):
+    """MRV2 GQA implementation for prefill context parallelism."""
+
+    supports_pcp = True
+
+    def reshape_and_cache(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: AscendAttentionPCPMetadata,
+        output: torch.Tensor,
+    ):
+        if len(kv_cache) <= 1:
+            return query, key, value, output
+
+        if self.key_cache is None:
+            self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+        if self.kv_sharing_target_layer_name is not None:
+            if self.is_kv_producer:
+                attn_metadata.reshape_cache_event.record()
+            return query, key, value, output
+
+        expanded_slot_mapping = attn_metadata.pcp_slot_mapping
+        if expanded_slot_mapping is None:
+            raise RuntimeError("GQA PCP metadata is missing the expanded slot mapping.")
+        local_num_input_tokens = attn_metadata.pcp_local_num_input_tokens
+        if key.shape[0] < local_num_input_tokens:
+            raise RuntimeError(
+                f"PCP GQA input is shorter than the rank-local padded batch: {key.shape[0]} < {local_num_input_tokens}."
+            )
+
+        (cache_key, cache_value), cache_slot_mapping = _gather_prefill_cache_inputs(
+            (
+                key[:local_num_input_tokens],
+                value[:local_num_input_tokens],
+            ),
+            expanded_slot_mapping,
+            attn_metadata.num_decode_tokens,
+        )
+        logger.info_once(
+            "[GQA-PCP] Entered KV gather path: local_kv=%s, gathered_kv=%s, slots=%s",
+            tuple(key[:local_num_input_tokens].shape),
+            tuple(cache_key.shape),
+            tuple(cache_slot_mapping.shape),
+        )
+        DeviceOperator.reshape_and_cache(
+            key=cache_key,
+            value=cache_value,
+            key_cache=self.key_cache,
+            value_cache=self.value_cache,
+            slot_mapping=cache_slot_mapping,
+        )
+        notify_kv_cache_written()
+        return query, key, value, output
 
 
 class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):

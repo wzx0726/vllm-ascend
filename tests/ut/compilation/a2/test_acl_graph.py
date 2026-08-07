@@ -25,11 +25,10 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor, ForwardContext
 
 from tests.ut.base import TestBase
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionPCPImpl
 from vllm_ascend.attention.context_parallel.attention_cp import (
     AscendAttentionDCPImpl,
     AscendAttentionDCPMetadata,
-    AscendAttentionPCPImpl,
     AscendMetadataForDecode,
 )
 from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaDCPImpl
