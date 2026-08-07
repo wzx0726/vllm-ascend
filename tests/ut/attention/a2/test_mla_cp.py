@@ -11,9 +11,6 @@ from vllm_ascend.attention.context_parallel.mla_cp import (
     AscendMLADCPDecodeMetadata,
     AscendMlaDCPImpl,
     AscendMlaDCPMetadataBuilder,
-    AscendMLAPCPImpl,
-    AscendMLAPCPMetadata,
-    AscendMLAPCPMetadataBuilder,
     DCPChunkedContextMetadata,
 )
 from vllm_ascend.attention.mla_v1 import (
@@ -21,6 +18,9 @@ from vllm_ascend.attention.mla_v1 import (
     AscendMLAImpl,
     AscendMLAMetadata,
     AscendMLAMetadataBuilder,
+    AscendMLAPCPImpl,
+    AscendMLAPCPMetadata,
+    AscendMLAPCPMetadataBuilder,
     AscendMLAPrefillMetadata,
 )
 
@@ -213,11 +213,11 @@ def test_mla_pcp_prefill_gathers_cache_inputs_and_keeps_local_kv() -> None:
     kv_no_split = torch.arange(12, dtype=torch.float32).view(4, 3)
     with (
         patch(
-            "vllm_ascend.attention.context_parallel.mla_cp.get_pcp_group",
+            "vllm_ascend.attention.mla_v1.get_pcp_group",
             return_value=pcp_group,
         ),
         patch(
-            "vllm_ascend.attention.context_parallel.mla_cp._gather_prefill_cache_inputs",
+            "vllm_ascend.attention.mla_v1._gather_prefill_cache_inputs",
             side_effect=fake_gather,
         ),
     ):

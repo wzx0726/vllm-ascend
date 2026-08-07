@@ -15,6 +15,8 @@ from vllm_ascend.attention.mla_v1 import (
     AscendMLAImpl,
     AscendMLAMetadata,
     AscendMLAMetadataBuilder,
+    AscendMLAPCPImpl,
+    AscendMLAPCPMetadataBuilder,
     AscendMLAPrefillMetadata,
     ChunkedContextMetadata,
     DecodeMLAPreprocessResult,
@@ -61,11 +63,6 @@ class TestAscendMLABackend(TestBase):
         self.assertEqual(result, AscendMLAImpl)
 
     def test_get_builder_and_impl_cls_with_pcp(self):
-        from vllm_ascend.attention.context_parallel.mla_cp import (
-            AscendMLAPCPImpl,
-            AscendMLAPCPMetadataBuilder,
-        )
-
         self.mock_parallel_config.prefill_context_parallel_size = 2
         self.assertIs(AscendMLABackend.get_builder_cls(), AscendMLAPCPMetadataBuilder)
         self.assertIs(AscendMLABackend.get_impl_cls(), AscendMLAPCPImpl)
