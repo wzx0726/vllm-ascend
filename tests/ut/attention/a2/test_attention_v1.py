@@ -9,6 +9,8 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
     AscendAttentionMetadataBuilder,
+    AscendAttentionPCPImpl,
+    AscendAttentionPCPMetadataBuilder,
     AscendAttentionState,
     AscendC8AttentionBackendImpl,
 )
@@ -88,10 +90,6 @@ class TestAscendAttentionBackend(TestBase):
         self.mock_config.parallel_config.prefill_context_parallel_size = 2
         self.enable_pcp.cache_clear()
 
-        from vllm_ascend.attention.context_parallel.attention_cp import (
-            AscendAttentionPCPImpl,
-        )
-
         self.assertIs(
             AscendAttentionBackend.get_impl_cls(),
             AscendAttentionPCPImpl,
@@ -100,10 +98,6 @@ class TestAscendAttentionBackend(TestBase):
     def test_get_builder_cls_with_pcp(self):
         self.mock_config.parallel_config.prefill_context_parallel_size = 2
         self.enable_pcp.cache_clear()
-
-        from vllm_ascend.attention.context_parallel.attention_cp import (
-            AscendAttentionPCPMetadataBuilder,
-        )
 
         self.assertIs(
             AscendAttentionBackend.get_builder_cls(),
