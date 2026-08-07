@@ -4,12 +4,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 import torch
 
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackendImpl,
     AscendAttentionMetadataBuilder,
     AscendAttentionState,
+    AscendC8AttentionBackendImpl,
     AscendMetadata,
 )
 from vllm_ascend.attention.context_parallel.attention_cp import (
@@ -80,7 +82,16 @@ def test_pcp_builder_selects_rank_slots_and_uses_cached_prefill() -> None:
     assert metadata.attn_state == AscendAttentionState.ChunkedPrefill
 
 
-def test_pcp_builder_preserves_chunked_prefill_state() -> None:
+@pytest.mark.parametrize(
+    "initial_state",
+    [
+        AscendAttentionState.PrefillNoCache,
+        AscendAttentionState.PrefillCacheHit,
+        AscendAttentionState.DecodeOnly,
+        AscendAttentionState.ChunkedPrefill,
+    ],
+)
+def test_pcp_builder_uses_chunked_state_for_every_prefill(initial_state) -> None:
     builder = AscendAttentionPCPMetadataBuilder.__new__(AscendAttentionPCPMetadataBuilder)
     builder.pcp_size = 2
     builder.pcp_rank = 0
@@ -89,7 +100,7 @@ def test_pcp_builder_preserves_chunked_prefill_state() -> None:
         num_actual_tokens=2,
         num_decode_tokens=0,
         num_prefills=1,
-        attn_state=AscendAttentionState.ChunkedPrefill,
+        attn_state=initial_state,
     )
 
     with patch.object(
@@ -102,6 +113,29 @@ def test_pcp_builder_preserves_chunked_prefill_state() -> None:
     assert torch.equal(metadata.slot_mapping, torch.tensor([10, 11]))
     assert metadata.pcp_local_num_input_tokens == 3
     assert metadata.attn_state == AscendAttentionState.ChunkedPrefill
+
+
+def test_pcp_builder_preserves_decode_only_state() -> None:
+    builder = AscendAttentionPCPMetadataBuilder.__new__(AscendAttentionPCPMetadataBuilder)
+    builder.pcp_size = 2
+    builder.pcp_rank = 1
+    common_metadata = SimpleNamespace(slot_mapping=torch.tensor([10, 11, -1, -1], dtype=torch.int64))
+    base_metadata = AscendAttentionPCPMetadata(
+        num_actual_tokens=2,
+        num_decode_tokens=2,
+        num_prefills=0,
+        attn_state=AscendAttentionState.DecodeOnly,
+    )
+
+    with patch.object(
+        AscendAttentionMetadataBuilder,
+        "build",
+        return_value=base_metadata,
+    ):
+        metadata = builder.build(0, common_metadata)
+
+    assert torch.equal(metadata.slot_mapping, torch.tensor([10, 11]))
+    assert metadata.attn_state == AscendAttentionState.DecodeOnly
 
 
 def test_pcp_builder_rejects_nondivisible_expanded_slots() -> None:
@@ -255,6 +289,67 @@ def test_pcp_cache_gather_pure_prefill_odd_length_with_padding() -> None:
         torch.tensor([10, 11, -1, 12, 13, 14]),
     )
     notify_cache_written.assert_called_once_with()
+
+
+def test_pcp_cache_hit_c8_chunked_prefill_gathers_and_dequantizes() -> None:
+    impl = AscendC8AttentionBackendImpl.__new__(AscendC8AttentionBackendImpl)
+    impl.num_heads = 2
+    impl.num_kv_heads = 1
+    impl.head_size = 4
+    impl.scale = 1.0
+    impl.key_cache = torch.empty((2, 32, 1, 4), dtype=torch.int8)
+    impl.value_cache = torch.empty((2, 32, 1, 4), dtype=torch.int8)
+
+    query = torch.zeros((1, 2, 4))
+    new_key = torch.zeros((1, 1, 4))
+    new_value = torch.zeros((1, 1, 4))
+    output = torch.empty_like(query)
+    metadata = AscendAttentionPCPMetadata(
+        num_decode_tokens=0,
+        num_decodes=0,
+        num_prefills=1,
+        actual_seq_lengths_q=[1],
+        seq_lens_list=[33],
+        block_tables=torch.tensor([[0, 1]], dtype=torch.long),
+        attn_mask=None,
+    )
+    dense_key = torch.zeros((33, 1, 4))
+    dense_value = torch.zeros((33, 1, 4))
+    layer = SimpleNamespace()
+
+    with (
+        patch.object(
+            impl,
+            "_nz_5d_view",
+            side_effect=[impl.key_cache, impl.value_cache],
+        ),
+        patch.object(
+            impl,
+            "_dequant_paged_kv_to_dense",
+            return_value=(dense_key, dense_value),
+        ) as dequant,
+        patch(
+            "vllm_ascend.attention.attention_v1.torch_npu.npu_fused_infer_attention_score",
+            return_value=(torch.ones_like(query), None),
+        ) as fused_attention,
+    ):
+        result = impl._forward_c8_chunked_prefill(
+            query,
+            new_key,
+            new_value,
+            metadata,
+            output,
+            layer,
+        )
+
+    dequant.assert_called_once()
+    assert dequant.call_args.args[2] is metadata.block_tables
+    assert dequant.call_args.args[3] == [33]
+    fused_kwargs = fused_attention.call_args.kwargs
+    assert fused_kwargs["key"] is dense_key
+    assert fused_kwargs["value"] is dense_value
+    assert fused_kwargs["actual_seq_lengths"] == [1]
+    torch.testing.assert_close(result, torch.ones_like(query))
 
 
 def test_pcp_decode_only_does_not_all_gather_kv() -> None:

@@ -125,7 +125,11 @@ class AscendAttentionPCPMetadataBuilder(AscendAttentionMetadataBuilder):
         )
         metadata.pcp_slot_mapping = expanded_slot_mapping
         metadata.pcp_local_num_input_tokens = local_num_input_tokens
-        if metadata.num_prefills > 0 and metadata.attn_state == AscendAttentionState.PrefillNoCache:
+        # PCP always executes prefill tokens through the chunked-prefill path,
+        # including a one-token suffix left by a prefix-cache hit. The generic
+        # state builder classifies an all-one-token batch as decode-only, while
+        # the PCP-aware split above correctly keeps such tokens in prefill.
+        if metadata.num_prefills > 0:
             metadata.attn_state = AscendAttentionState.ChunkedPrefill
         return metadata
 
