@@ -207,6 +207,7 @@ def test_get_effective_block_size(
 
 def test_get_kv_cache_coordinator_delegates_single_group(monkeypatch) -> None:
     sentinel = object()
+    captured_kwargs = None
     kv_cache_config = _make_hybrid_kv_cache_config(full_block_size=16, mamba_block_size=16)
     single_group_config = KVCacheConfig(
         num_blocks=kv_cache_config.num_blocks,
@@ -215,6 +216,8 @@ def test_get_kv_cache_coordinator_delegates_single_group(monkeypatch) -> None:
     )
 
     def _fake_orig(*args, **kwargs):
+        nonlocal captured_kwargs
+        captured_kwargs = kwargs
         return sentinel
 
     monkeypatch.setattr(
@@ -230,11 +233,15 @@ def test_get_kv_cache_coordinator_delegates_single_group(monkeypatch) -> None:
         enable_caching=True,
         enable_kv_cache_events=False,
         dcp_world_size=1,
-        pcp_world_size=1,
+        pcp_world_size=2,
         hash_block_size=16,
     )
 
     assert coordinator is sentinel
+    assert captured_kwargs is not None
+    assert captured_kwargs["dcp_world_size"] == 1
+    assert captured_kwargs["pcp_world_size"] == 1
+    assert captured_kwargs["hash_block_size"] == 16
 
 
 def test_get_kv_cache_coordinator_delegates_hybrid_without_caching(monkeypatch) -> None:
