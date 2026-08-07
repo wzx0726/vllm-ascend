@@ -759,11 +759,13 @@ class AscendMLAPCPMetadataBuilder(AscendMLAMetadataBuilder):
         # valid cache-write slots only in rank 0's expanded row. A decode-only
         # batch can therefore use the persistent rank-0 view directly, which
         # keeps the slot mapping address stable between capture and replay.
+        # decode only，copy teh slot_mappings
         if metadata.num_prefills == 0:
             metadata.slot_mapping = rank_slot_mappings[0, : metadata.num_actual_tokens]
         else:
             # Prefill rows use the slots belonging to this rank's
             # DualChunkSwap partition.
+            # decode get the rank 0, prefill get current rank
             metadata.slot_mapping = torch.cat(
                 (
                     rank_slot_mappings[0, :num_decode_tokens],
@@ -775,6 +777,12 @@ class AscendMLAPCPMetadataBuilder(AscendMLAMetadataBuilder):
             )
         metadata.pcp_slot_mapping = expanded_slot_mapping
         metadata.pcp_local_num_input_tokens = local_num_input_tokens
+        # PCP partitions prefill tokens into rank-local chunks, including
+        # continued prefills whose uncached suffix contains only one token.
+        # Keep decode-only batches on their graph path, but route every batch
+        # containing prefill work through the chunked-prefill implementation.
+        if metadata.num_prefills > 0:
+            metadata.attn_state = AscendAttentionState.ChunkedPrefill
         return metadata
 
 
@@ -1925,7 +1933,7 @@ class AscendMLAPCPImpl(AscendMLAImpl):
         cos = attn_metadata.prefill.cos
         sin = attn_metadata.prefill.sin
         prefill_q_pe = self.rope_single(prefill_q_pe, cos, sin)
-
+        #get local KV to all gather(contain pad)
         local_prefill_kv = kv_no_split[num_decode_tokens:local_num_input_tokens]
         padded_cos = self._pad_tokens(cos, local_prefill_capacity)
         padded_sin = self._pad_tokens(sin, local_prefill_capacity)
@@ -1935,6 +1943,7 @@ class AscendMLAPCPImpl(AscendMLAImpl):
             pcp_group.world_size,
             local_num_input_tokens,
         )
+        # Remove the decoding area and flatten it.
         expanded_prefill_slots = rank_slot_mappings[:, num_decode_tokens:].flatten()
         (gathered_kv, gathered_cos, gathered_sin), gathered_prefill_slots = _gather_prefill_cache_inputs(
             (local_prefill_kv, padded_cos, padded_sin),
@@ -1948,7 +1957,7 @@ class AscendMLAPCPImpl(AscendMLAImpl):
             tuple(gathered_kv.shape),
             tuple(gathered_prefill_slots.shape),
         )
-
+        # ALL gather kv
         gathered_k_pe, gathered_k_c_normed = self.exec_kv_prefill(
             gathered_kv,
             gathered_cos,

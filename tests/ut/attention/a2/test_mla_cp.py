@@ -4,6 +4,7 @@ from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -29,6 +30,7 @@ def _make_pcp_metadata(
     *,
     num_actual_tokens: int,
     num_decode_tokens: int,
+    attn_state: AscendAttentionState = AscendAttentionState.ChunkedPrefill,
 ) -> AscendMLAPCPMetadata:
     return AscendMLAPCPMetadata(
         num_actual_tokens=num_actual_tokens,
@@ -40,7 +42,40 @@ def _make_pcp_metadata(
         num_decodes=int(num_decode_tokens > 0),
         num_decode_tokens=num_decode_tokens,
         num_prefills=int(num_actual_tokens > num_decode_tokens),
+        attn_state=attn_state,
     )
+
+
+@pytest.mark.parametrize(
+    "initial_state",
+    [
+        AscendAttentionState.PrefillNoCache,
+        AscendAttentionState.PrefillCacheHit,
+        AscendAttentionState.DecodeOnly,
+        AscendAttentionState.ChunkedPrefill,
+    ],
+)
+def test_mla_pcp_metadata_normalizes_prefill_state(initial_state) -> None:
+    expanded_slots = torch.tensor([10, -1, 20, -1], dtype=torch.int64)
+    common_metadata = SimpleNamespace(slot_mapping=expanded_slots)
+    metadata = _make_pcp_metadata(
+        num_actual_tokens=1,
+        num_decode_tokens=0,
+        attn_state=initial_state,
+    )
+    builder = AscendMLAPCPMetadataBuilder.__new__(AscendMLAPCPMetadataBuilder)
+    builder.pcp_size = 2
+    builder.pcp_rank = 0
+
+    with patch.object(
+        AscendMLAMetadataBuilder,
+        "build",
+        return_value=metadata,
+    ):
+        result = builder.build(0, common_metadata)
+
+    assert result.num_prefills == 1
+    assert result.attn_state == AscendAttentionState.ChunkedPrefill
 
 
 def test_mla_pcp_metadata_selects_rank_local_prefill_slots() -> None:
@@ -131,6 +166,7 @@ def test_mla_pcp_decode_metadata_uses_persistent_rank_zero_view() -> None:
     metadata = _make_pcp_metadata(
         num_actual_tokens=4,
         num_decode_tokens=4,
+        attn_state=AscendAttentionState.DecodeOnly,
     )
     metadata.num_decodes = 4
     metadata.query_start_loc = torch.arange(5, dtype=torch.int32)
@@ -148,6 +184,7 @@ def test_mla_pcp_decode_metadata_uses_persistent_rank_zero_view() -> None:
     assert result.num_actual_tokens == 4
     assert result.num_decodes == 4
     assert result.num_prefills == 0
+    assert result.attn_state == AscendAttentionState.DecodeOnly
     assert result.slot_mapping.data_ptr() == expanded_slots.data_ptr()
     assert result.slot_mapping.tolist() == [5, 6, -1, -1]
 
