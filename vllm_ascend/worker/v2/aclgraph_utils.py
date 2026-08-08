@@ -127,6 +127,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         # when call `run_fullgraph` method in CudaGraphManager,
         # then we don't need to # copy `execute_model` method in `NPUModelRunner` class.
         self.model_runner = model_runner
+        self._pcp_batch_has_prefill = False
         # The attention backend keys its per-size graph params by the actual
         # captured token counts (rounded up to decode_query_len when using
         # speculative decoding), so derive them from the capture descriptors
@@ -136,6 +137,36 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         # so we need to set graph params before capture full graph.
         if super().needs_capture():
             set_graph_params(self.capture_sizes)
+
+    def set_pcp_batch_has_prefill(self, has_prefill: bool) -> None:
+        """Record whether the current PCP batch contains prefill tokens."""
+        self._pcp_batch_has_prefill = has_prefill
+
+    def dispatch(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        num_active_loras: int = 0,
+    ) -> BatchExecutionDescriptor:
+        desc = super().dispatch(
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            num_active_loras,
+        )
+        # FULL_DECODE_ONLY dispatch is shape-based and cannot distinguish a
+        # one-token decode from a one-token suffix left by a prefix-cache hit.
+        # Reject only the invalid full graph, preserving PIECEWISE and eager
+        # dispatch for all other PCP batches.
+        if self._pcp_batch_has_prefill and desc.cg_mode == CUDAGraphMode.FULL:
+            return BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                num_active_loras=desc.num_active_loras,
+            )
+        return desc
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
