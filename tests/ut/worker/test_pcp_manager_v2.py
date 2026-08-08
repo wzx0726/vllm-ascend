@@ -26,6 +26,7 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
 import vllm_ascend.worker.v2.pcp_manager as pcp_manager_module
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
@@ -781,4 +782,3 @@ def test_prepare_dummy_attn_reuses_and_clears_persistent_buffers():
 
     assert replay_block_tables[0].data_ptr() == dummy_block_tables[0].data_ptr()
     assert replay_slot_mappings.data_ptr() == dummy_slot_mappings.data_ptr()
-

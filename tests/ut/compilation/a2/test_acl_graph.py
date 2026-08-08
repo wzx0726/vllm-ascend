@@ -35,7 +35,7 @@ from vllm_ascend.attention.context_parallel.mla_cp import (
     AscendMLADCPDecodeMetadata,
     AscendMlaDCPImpl,
 )
-from vllm_ascend.attention.mla_v1 import AscendMLADecodeMetadata, AscendMLAMetadata
+from vllm_ascend.attention.mla_v1 import AscendMLAMetadata
 from vllm_ascend.attention.utils import enable_dcp, enable_pcp
 from vllm_ascend.compilation import acl_graph
 from vllm_ascend.compilation.acl_graph import (

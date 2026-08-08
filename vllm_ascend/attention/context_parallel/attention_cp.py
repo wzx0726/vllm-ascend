@@ -22,7 +22,6 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
-
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackendImpl,

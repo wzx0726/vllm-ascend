@@ -24,7 +24,6 @@ import torch_npu
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import get_pcp_group
-from vllm.logger import logger
 from vllm.model_executor.layers.attention.pcp import _gather_prefill_cache_inputs
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore

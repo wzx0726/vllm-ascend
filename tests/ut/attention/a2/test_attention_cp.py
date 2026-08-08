@@ -435,4 +435,3 @@ def test_pcp_builder_keeps_short_extend_in_prefill() -> None:
     result = builder._split_decodes_and_prefills(common_metadata)
 
     assert result == (0, 2, 0, 5)
-
