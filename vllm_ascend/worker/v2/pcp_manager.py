@@ -22,16 +22,18 @@ from dataclasses import replace
 import numpy as np
 import torch
 from vllm.config import VllmConfig
-from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
-from vllm.v1.worker.gpu.pcp_manager import PCPManager
+from vllm.v1.worker.gpu.pcp_manager import PCPManager, PCPManagerRegistry
 from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
+
+
+ASCEND_PCP_MANAGER_NAME = "ascend"
 
 
 class AscendPCPManager(PCPManager):
@@ -262,31 +264,8 @@ class AscendPCPManager(PCPManager):
         return self._gathered_kv_slot_mappings[:, :graph_num_expanded_tokens]
 
 
-def maybe_build_ascend_pcp_manager(
-    vllm_config: VllmConfig,
-    device: torch.device,
-    supports_mm_inputs: bool,
-    req_states: RequestState,
-    block_tables: BlockTables,
-) -> AscendPCPManager | None:
-    """Build the Ascend PCP manager after validating the supported subset."""
-    parallel_config = vllm_config.parallel_config
-    pcp_size = parallel_config.prefill_context_parallel_size
-    if pcp_size <= 1:
-        return None
-
-    AscendPCPManager.validate_config(vllm_config, supports_mm_inputs)
-    dcp_size = parallel_config.decode_context_parallel_size
-    return AscendPCPManager(
-        pcp_world_size=pcp_size,
-        pcp_rank=get_pcp_group().rank_in_group,
-        device=device,
-        vllm_config=vllm_config,
-        req_states=req_states,
-        max_num_reqs=vllm_config.scheduler_config.max_num_seqs,
-        max_num_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
-        block_tables=block_tables,
-        dcp_world_size=dcp_size,
-        dcp_rank=get_dcp_group().rank_in_group if dcp_size > 1 else 0,
-        cp_interleave=parallel_config.cp_kv_cache_interleave_size,
-    )
+PCPManagerRegistry.register_manager(
+    ASCEND_PCP_MANAGER_NAME,
+    "vllm_ascend.worker.v2.pcp_manager",
+    "AscendPCPManager",
+)

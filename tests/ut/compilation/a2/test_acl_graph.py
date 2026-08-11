@@ -179,6 +179,7 @@ def test_prepare_pcp_inputs_to_capture_uses_partitioned_persistent_buffers():
             [[MagicMock()]],
             MagicMock(),
             pcp_manager,
+            full_cudagraph=True,
         )
 
     assert events == ["partition", "dummy_attn", "metadata"]
@@ -232,6 +233,7 @@ def test_pcp_full_capture_temporarily_installs_and_restores_preparation():
             MagicMock(),
             [],
             MagicMock(),
+            full_cudagraph=True,
         )
 
     with (
@@ -256,7 +258,7 @@ def test_pcp_full_capture_temporarily_installs_and_restores_preparation():
     assert result is prepared_state
     assert worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture is original_prepare
     assert prepare_pcp.call_args.args[7] is pcp_manager
-    assert prepare_pcp.call_args.kwargs["skip_attn"] is False
+    assert prepare_pcp.call_args.kwargs["full_cudagraph"] is True
 
 
 def test_pcp_full_capture_restores_preparation_after_exception():
