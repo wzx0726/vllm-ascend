@@ -56,7 +56,10 @@ from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
-from vllm_ascend.worker.v2.pcp_manager import maybe_build_ascend_pcp_manager
+from vllm_ascend.worker.v2.pcp_manager import (
+    ASCEND_PCP_MANAGER_NAME,
+    AscendPCPManager,
+)
 from vllm_ascend.worker.v2.sp_utils import (
     _all_gather_hidden_states_and_aux,
     _flashcomm_enabled,
@@ -115,6 +118,8 @@ def flashcomm_dispatch_wrapper(vllm_config: VllmConfig):
 class NPUModelRunner(GPUModelRunner):
     """Model runner for Ascend NPUs."""
 
+    pcp_manager_name = ASCEND_PCP_MANAGER_NAME
+
     execute_model_state: ExecuteModelState | None
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -123,11 +128,7 @@ class NPUModelRunner(GPUModelRunner):
         # FusedMoE can be constructed by the parent initializer and reads this
         # capacity while setting up MC2 communication.
         set_potential_max_tokens(vllm_config)
-        # The following features are not yet supported in Ascend NPU model runner v2:
-        # - Context parallelism (prefill or decode)
         parallel_config = vllm_config.parallel_config
-        if parallel_config.prefill_context_parallel_size > 1 or parallel_config.decode_context_parallel_size > 1:
-            raise NotImplementedError("Context parallelism is not supported by Ascend NPU model runner v2.")
 
         with torch_cuda_wrapper():
             super().__init__(vllm_config, device)
@@ -209,15 +210,10 @@ class NPUModelRunner(GPUModelRunner):
         with graph_manager_wrapper(self):
             super().initialize_kv_cache(kv_cache_config)
 
-            # GPUModelRunner constructs the community PCP manager while initializing
-            # the KV cache. Replace it with the Ascend subclass.
-            self.pcp_manager = maybe_build_ascend_pcp_manager(
-                self.vllm_config,
-                self.device,
-                self.supports_mm_inputs,
-                self.req_states,
-                self.block_tables,
-            )
+            if self.pcp_manager is not None:
+                assert isinstance(self.pcp_manager, AscendPCPManager)
+                if self.speculator is not None:
+                    self.speculator.pcp_manager = self.pcp_manager
 
     @torch.inference_mode()
     def execute_model(

@@ -33,12 +33,12 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, ModelCudaGraphManager
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.compilation.acl_graph import set_graph_params, update_full_graph_params
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
-from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -64,8 +64,8 @@ def _prepare_pcp_inputs_to_capture(
     block_tables: BlockTables,
     attn_groups: list[list[AttentionGroup]],
     kv_cache_config: KVCacheConfig,
-    pcp_manager: AscendPCPManager,
-    skip_attn: bool = False,
+    pcp_manager: PCPManager,
+    full_cudagraph: bool,
 ) -> cudagraph_utils.AttentionState:
     """Build PCP capture metadata from the buffers used during replay."""
     if not isinstance(input_buffers, AscendInputBuffers):
@@ -87,17 +87,59 @@ def _prepare_pcp_inputs_to_capture(
         kv_cache_config,
     )
 
-    attn_metadata = None
-    if not skip_attn:
-        attn_metadata = model_state.prepare_attn(
-            input_batch,
-            CUDAGraphMode.NONE,
-            input_block_tables,
-            slot_mappings,
-            attn_groups,
-            kv_cache_config,
-            for_capture=True,
+    attn_metadata = model_state.prepare_attn(
+        input_batch,
+        CUDAGraphMode.NONE,
+        input_block_tables,
+        slot_mappings,
+        attn_groups,
+        kv_cache_config,
+        for_capture=full_cudagraph,
+    )
+    return cudagraph_utils.AttentionState(
+        attn_metadata,
+        slot_mappings_by_layer,
+    )
+
+
+def prepare_pcp_speculator_inputs_to_capture(
+    num_reqs: int,
+    num_tokens: int,
+    model_state: ModelState,
+    input_buffers: InputBuffers,
+    block_tables: BlockTables,
+    attn_groups: list[list[AttentionGroup]],
+    kv_cache_config: KVCacheConfig,
+    pcp_manager: PCPManager,
+    full_cudagraph: bool,
+) -> cudagraph_utils.AttentionState:
+    """Build global draft-prefill metadata with a PCP-expanded KV layout."""
+    if not isinstance(input_buffers, AscendInputBuffers):
+        raise TypeError(
+            "MRV2 PCP speculator graph capture requires AscendInputBuffers, "
+            f"got {type(input_buffers).__name__}."
         )
+
+    input_batch = AscendInputBatch.make_dummy(
+        num_reqs,
+        num_tokens,
+        input_buffers,
+    )
+    input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
+    slot_mappings = pcp_manager.get_dummy_slot_mappings(num_tokens)
+    slot_mappings_by_layer = cudagraph_utils.build_slot_mappings_by_layer(
+        slot_mappings,
+        kv_cache_config,
+    )
+    attn_metadata = model_state.prepare_attn(
+        input_batch,
+        CUDAGraphMode.NONE,
+        input_block_tables,
+        slot_mappings,
+        attn_groups,
+        kv_cache_config,
+        for_capture=full_cudagraph,
+    )
     return cudagraph_utils.AttentionState(
         attn_metadata,
         slot_mappings_by_layer,
@@ -219,6 +261,9 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         """Capture CUDA graphs for model forward pass."""
         model = ModelWithContext(model)
         capture = super().capture
+        # Import lazily to avoid a cycle during Ascend plugin patch registration.
+        from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
+
         pcp_manager = getattr(self.model_runner, "pcp_manager", None)
         use_pcp_full_capture = isinstance(pcp_manager, AscendPCPManager) and self.cudagraph_mode.has_full_cudagraphs()
 
@@ -251,7 +296,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 block_tables: BlockTables,
                 attn_groups: list[list[AttentionGroup]],
                 kv_cache_config: KVCacheConfig,
-                skip_attn: bool = False,
+                full_cudagraph: bool,
             ) -> cudagraph_utils.AttentionState:
                 return _prepare_pcp_inputs_to_capture(
                     num_reqs,
@@ -262,7 +307,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                     attn_groups,
                     kv_cache_config,
                     pcp_manager,
-                    skip_attn=skip_attn,
+                    full_cudagraph=full_cudagraph,
                 )
 
             cudagraph_utils.prepare_inputs_to_capture = prepare_pcp_inputs

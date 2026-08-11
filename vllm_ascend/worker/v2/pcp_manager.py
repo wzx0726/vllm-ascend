@@ -22,11 +22,10 @@ from dataclasses import replace
 import numpy as np
 import torch
 from vllm.config import VllmConfig
-from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
-from vllm.v1.worker.gpu.pcp_manager import PCPManager
+from vllm.v1.worker.gpu.pcp_manager import PCPManager, PCPManagerRegistry
 from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -36,6 +35,18 @@ from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
 class AscendPCPManager(PCPManager):
     """PCP manager that refreshes Ascend-only local-batch metadata."""
+
+    @staticmethod
+    def validate_config(
+        vllm_config: VllmConfig,
+        supports_mm_inputs: bool,
+    ) -> None:
+        """Validate the speculative methods supported by Ascend MRV2 PCP."""
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.prefill_context_parallel_size <= 1:
+            return
+
+
 
     def __init__(
         self,
@@ -65,22 +76,39 @@ class AscendPCPManager(PCPManager):
         )
         self.vllm_config = vllm_config
 
-    def partition_batch(self, input_batch: AscendInputBatch) -> AscendInputBatch:
-        """Partition the batch and update Ascend-specific local metadata."""
+    def partition_batch(
+        self,
+        input_batch: AscendInputBatch,
+    ) -> AscendInputBatch:
+        """Reuse upstream PCP partitioning and refresh Ascend-only metadata."""
         assert self.vllm_config is not None
         graph_num_reqs = input_batch.num_reqs_after_padding
         graph_num_tokens = input_batch.num_tokens_after_padding
         is_decode_only = not np.any(input_batch.is_prefilling_np)
 
-        local_batch = super().partition_batch(input_batch)
-        assert isinstance(local_batch, AscendInputBatch)
+        upstream_input_batch = input_batch
+        if input_batch.num_draft_tokens > 0:
+            # The upstream implementation only uses num_draft_tokens to reject
+            # speculative decoding, then clears the two draft fields on the
+            # returned rank-local batch. Present the same post-guard view while
+            # retaining the real global batch for proposal and sampling.
+            upstream_input_batch = replace(
+                input_batch,
+                num_draft_tokens=0,
+                num_draft_tokens_per_req=None,
+            )
 
-        local_seq_lens_np = local_batch.num_computed_tokens_np + local_batch.num_scheduled_tokens
+        try:
+            local_batch = super().partition_batch(upstream_input_batch)
+        finally:
+            self._global_batch = input_batch
+
+        assert isinstance(local_batch, AscendInputBatch)
+        local_seq_lens_np = (
+            local_batch.num_computed_tokens_np
+            + local_batch.num_scheduled_tokens
+        )
         if is_decode_only:
-            # PCP partitioning must not change the semantic attention state of
-            # a decode-only batch. In particular, dummy sequence lengths used
-            # for full-decode graph capture look like a fresh prefill to
-            # build_attn_state(), even though make_dummy() selected decode.
             local_batch.attn_state = input_batch.attn_state
             if local_batch.attn_state is None:
                 local_batch.attn_state = AscendAttentionState.DecodeOnly
@@ -97,15 +125,52 @@ class AscendPCPManager(PCPManager):
             local_seq_lens_np,
             local_batch.num_reqs,
             local_batch.num_scheduled_tokens,
-            local_batch.num_scheduled_tokens
-            - (
-                local_batch.num_draft_tokens_per_req
-                if local_batch.num_draft_tokens_per_req is not None
-                else 0
-            ),
+            local_batch.num_scheduled_tokens,
         )
         local_batch.seq_lens_np = local_seq_lens_np
         return local_batch
+
+    def prepare_speculator_attn(
+        self,
+        input_batch: AscendInputBatch,
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        """Build the global KV layout consumed by a PCP speculator."""
+        if input_batch is not self._global_batch:
+            raise RuntimeError(
+                "PCP speculative proposal must use the restored global batch."
+            )
+        assert self._block_tables is not None
+        block_tables = self._block_tables.gather_block_tables(
+            input_batch.idx_mapping,
+            num_reqs_padded=input_batch.num_reqs_after_padding,
+        )
+        assert self._global_batch_slot_mappings is not None
+        num_tokens = input_batch.num_tokens_after_padding
+        if num_tokens > input_batch.num_tokens:
+            self._global_batch_slot_mappings[
+                :,
+                input_batch.num_tokens : num_tokens,
+            ].fill_(PAD_SLOT_ID)
+        global_slot_mappings = self._global_batch_slot_mappings[:, :num_tokens]
+
+        assert self._gathered_kv_slot_mappings is not None
+        num_expanded_tokens = num_tokens * self.pcp_world_size
+        if num_expanded_tokens > self._gathered_kv_slot_mappings.shape[1]:
+            raise RuntimeError(
+                "PCP speculator slot mapping exceeds the persistent buffer "
+                f"capacity: {num_expanded_tokens} > "
+                f"{self._gathered_kv_slot_mappings.shape[1]}."
+            )
+        expanded_slot_mappings = self._gathered_kv_slot_mappings[
+            :, :num_expanded_tokens
+        ]
+        for rank in range(self.pcp_world_size):
+            rank_start = rank * num_tokens
+            expanded_slot_mappings[
+                :,
+                rank_start : rank_start + num_tokens,
+            ].copy_(global_slot_mappings)
+        return block_tables, expanded_slot_mappings
 
     def _pad_decode_batch_for_full_graph(
         self,
@@ -126,14 +191,20 @@ class AscendPCPManager(PCPManager):
 
         num_padding_reqs = graph_num_reqs - num_reqs
         num_padding_tokens = graph_num_tokens - num_tokens
-        uses_per_request_padding = num_padding_reqs == num_padding_tokens
+        decode_query_len = (
+            getattr(self.vllm_config, "num_speculative_tokens", 0) + 1
+        )
+        uses_per_request_padding = (
+            num_padding_tokens == num_padding_reqs * decode_query_len
+        )
         uses_single_fia_dummy = (
             num_padding_reqs == 1 and num_padding_tokens > 0
         )
         if not (uses_per_request_padding or uses_single_fia_dummy):
             raise RuntimeError(
-                "PCP FULL_DECODE_ONLY requires either one token per padded "
-                "request or one FIA dummy request for all padding tokens: "
+                "PCP FULL_DECODE_ONLY requires either a uniform decode query "
+                "per padded request or one FIA dummy request for all padding "
+                "tokens: "
                 f"{num_padding_tokens} tokens for {num_padding_reqs} requests."
             )
 
@@ -183,7 +254,7 @@ class AscendPCPManager(PCPManager):
         if uses_per_request_padding:
             query_start_loc_buffer_np[
                 num_reqs + 1 : graph_num_reqs + 1
-            ] = num_tokens + np.arange(
+            ] = num_tokens + decode_query_len * np.arange(
                 1,
                 num_padding_reqs + 1,
                 dtype=np.int32,
@@ -256,31 +327,11 @@ class AscendPCPManager(PCPManager):
         return self._gathered_kv_slot_mappings[:, :graph_num_expanded_tokens]
 
 
-def maybe_build_ascend_pcp_manager(
-    vllm_config: VllmConfig,
-    device: torch.device,
-    supports_mm_inputs: bool,
-    req_states: RequestState,
-    block_tables: BlockTables,
-) -> AscendPCPManager | None:
-    """Build the Ascend PCP manager with community validation semantics."""
-    parallel_config = vllm_config.parallel_config
-    pcp_size = parallel_config.prefill_context_parallel_size
-    if pcp_size <= 1:
-        return None
 
-    AscendPCPManager.validate_config(vllm_config, supports_mm_inputs)
-    dcp_size = parallel_config.decode_context_parallel_size
-    return AscendPCPManager(
-        pcp_world_size=pcp_size,
-        pcp_rank=get_pcp_group().rank_in_group,
-        device=device,
-        vllm_config=vllm_config,
-        req_states=req_states,
-        max_num_reqs=vllm_config.scheduler_config.max_num_seqs,
-        max_num_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
-        block_tables=block_tables,
-        dcp_world_size=dcp_size,
-        dcp_rank=get_dcp_group().rank_in_group if dcp_size > 1 else 0,
-        cp_interleave=parallel_config.cp_kv_cache_interleave_size,
-    )
+ASCEND_PCP_MANAGER_NAME = "ascend"
+
+PCPManagerRegistry.register_manager(
+    ASCEND_PCP_MANAGER_NAME,
+    "vllm_ascend.worker.v2.pcp_manager",
+    "AscendPCPManager",
+)
