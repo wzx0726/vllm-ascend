@@ -26,7 +26,7 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.pcp_manager import PCPManager
+from vllm.v1.worker.gpu.pcp_manager import PCPManager, maybe_build_pcp_manager
 
 import vllm_ascend.worker.v2.pcp_manager as pcp_manager_module
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
@@ -225,6 +225,21 @@ def test_partition_batch_refreshes_local_ascend_input_batch_metadata():
 def test_npu_model_runner_uses_ascend_pcp_manager() -> None:
     runner = NPUModelRunner.__new__(NPUModelRunner)
     assert runner.pcp_manager_cls is AscendPCPManager
+
+    with patch(
+        "vllm.v1.worker.gpu.pcp_manager.get_pcp_group",
+        return_value=SimpleNamespace(rank_in_group=0),
+    ):
+        manager = maybe_build_pcp_manager(
+            _make_gqa_pcp_config(),
+            torch.device("cpu"),
+            supports_mm_inputs=False,
+            req_states=MagicMock(),
+            block_tables=None,
+            cls=runner.pcp_manager_cls,
+        )
+
+    assert isinstance(manager, AscendPCPManager)
 
 
 def test_cached_prefill_partitions_only_the_scheduled_suffix() -> None:
