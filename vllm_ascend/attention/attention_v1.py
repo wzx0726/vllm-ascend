@@ -461,7 +461,6 @@ class AscendAttentionPCPMetadataBuilder(AscendAttentionMetadataBuilder):
         fast_build: bool = False,
     ) -> AscendAttentionPCPMetadata:
         expanded_slot_mapping = common_attn_metadata.slot_mapping
-        print(f'common_attn_metadata.slot_mapping = {common_attn_metadata.slot_mapping}')
         metadata = super().build(
             common_prefix_len,
             common_attn_metadata,
