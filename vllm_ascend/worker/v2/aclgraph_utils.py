@@ -30,15 +30,18 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import cudagraph_utils
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, ModelCudaGraphManager
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    BatchExecutionDescriptor,
+    ModelCudaGraphManager,
+)
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.compilation.acl_graph import set_graph_params, update_full_graph_params
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
-from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -53,7 +56,9 @@ def collect_sorted_captured_token_sizes(capture_descs: dict) -> list[int]:
     by these rounded token counts, so they must be derived from the actual
     capture descriptors, not the raw config sizes.
     """
-    return sorted({desc.num_tokens for descs in capture_descs.values() for desc in descs})
+    return sorted(
+        {desc.num_tokens for descs in capture_descs.values() for desc in descs}
+    )
 
 
 def _prepare_pcp_inputs_to_capture(
@@ -64,18 +69,21 @@ def _prepare_pcp_inputs_to_capture(
     block_tables: BlockTables,
     attn_groups: list[list[AttentionGroup]],
     kv_cache_config: KVCacheConfig,
-    pcp_manager: AscendPCPManager,
+    pcp_manager: PCPManager,
     full_cudagraph: bool,
 ) -> cudagraph_utils.AttentionState:
     """Build PCP capture metadata from the buffers used during replay."""
     if not isinstance(input_buffers, AscendInputBuffers):
-        raise TypeError(f"MRV2 PCP graph capture requires AscendInputBuffers, got {type(input_buffers).__name__}.")
+        raise TypeError(
+            f"MRV2 PCP graph capture requires AscendInputBuffers, got {type(input_buffers).__name__}."
+        )
 
     input_batch = AscendInputBatch.make_dummy(
         num_reqs,
         num_tokens,
         input_buffers,
     )
+
     input_batch = pcp_manager.partition_batch(input_batch)
     input_block_tables, slot_mappings = pcp_manager.prepare_dummy_attn(
         input_batch.num_reqs_after_padding,
@@ -86,6 +94,50 @@ def _prepare_pcp_inputs_to_capture(
         kv_cache_config,
     )
 
+    attn_metadata = model_state.prepare_attn(
+        input_batch,
+        CUDAGraphMode.NONE,
+        input_block_tables,
+        slot_mappings,
+        attn_groups,
+        kv_cache_config,
+        for_capture=full_cudagraph,
+    )
+    return cudagraph_utils.AttentionState(
+        attn_metadata,
+        slot_mappings_by_layer,
+    )
+
+
+def prepare_pcp_speculator_inputs_to_capture(
+    num_reqs: int,
+    num_tokens: int,
+    model_state: ModelState,
+    input_buffers: InputBuffers,
+    block_tables: BlockTables,
+    attn_groups: list[list[AttentionGroup]],
+    kv_cache_config: KVCacheConfig,
+    pcp_manager: PCPManager,
+    full_cudagraph: bool,
+) -> cudagraph_utils.AttentionState:
+    """Build global draft-prefill metadata with a PCP-expanded KV layout."""
+    if not isinstance(input_buffers, AscendInputBuffers):
+        raise TypeError(
+            "MRV2 PCP speculator graph capture requires AscendInputBuffers, "
+            f"got {type(input_buffers).__name__}."
+        )
+
+    input_batch = AscendInputBatch.make_dummy(
+        num_reqs,
+        num_tokens,
+        input_buffers,
+    )
+    input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
+    slot_mappings = pcp_manager.get_dummy_slot_mappings(num_tokens)
+    slot_mappings_by_layer = cudagraph_utils.build_slot_mappings_by_layer(
+        slot_mappings,
+        kv_cache_config,
+    )
     attn_metadata = model_state.prepare_attn(
         input_batch,
         CUDAGraphMode.NONE,
@@ -127,7 +179,6 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         # Reuse the public update_stream from model_runner (shared with draft).
         self.update_stream = self.model_runner.update_stream
         self._pcp_batch_has_prefill = False
-
         # The attention backend keys its per-size graph params by the actual
         # captured token counts (rounded up to decode_query_len when using
         # speculative decoding), so derive them from the capture descriptors
@@ -168,7 +219,9 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             )
         return desc
 
-    def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+    def run_fullgraph(
+        self, desc: BatchExecutionDescriptor
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
         logger.info_once("run_fullgraph with num_tokens=%s", num_tokens)
@@ -217,8 +270,14 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         """Capture CUDA graphs for model forward pass."""
         model = ModelWithContext(model)
         capture = super().capture
+        # Import lazily to avoid a cycle during Ascend plugin patch registration.
+        from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
+
         pcp_manager = getattr(self.model_runner, "pcp_manager", None)
-        use_pcp_full_capture = isinstance(pcp_manager, AscendPCPManager) and self.cudagraph_mode.has_full_cudagraphs()
+        use_pcp_full_capture = (
+            isinstance(pcp_manager, AscendPCPManager)
+            and self.cudagraph_mode.has_full_cudagraphs()
+        )
 
         def capture_graphs() -> None:
             return capture(
@@ -275,7 +334,9 @@ class ModelWithContext(nn.Module):
     so we can inherit vllm's CudaGraphManager._capture_full_graph.
     """
 
-    def __init__(self, original_model, is_draft_model=False, is_draft_model_prefill=False):
+    def __init__(
+        self, original_model, is_draft_model=False, is_draft_model_prefill=False
+    ):
         super().__init__()
         self.original_model = original_model
         self.is_draft_model = is_draft_model
@@ -317,7 +378,9 @@ class ModelWithContext(nn.Module):
 def model_capture_wrapper(speculator, is_draft_model_prefill):
     """Context manager to override speculator's model for speculator capturing."""
     try:
-        speculator.model = ModelWithContext(speculator.model, True, is_draft_model_prefill)
+        speculator.model = ModelWithContext(
+            speculator.model, True, is_draft_model_prefill
+        )
         yield
     finally:
         speculator.model = speculator.model.get_original_model()

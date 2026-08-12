@@ -63,7 +63,9 @@ def test_mrv2_initializes_dsv4_cache_only_layer(
         quant_config=None,
     )
 
-    cache_layer = deepseek_v4.AscendDeepseekV4IndexerCache.__new__(deepseek_v4.AscendDeepseekV4IndexerCache)
+    cache_layer = deepseek_v4.AscendDeepseekV4IndexerCache.__new__(
+        deepseek_v4.AscendDeepseekV4IndexerCache
+    )
     torch.nn.Module.__init__(cache_layer)
     cache_layer.head_dim = 128
     cache_layer.dtype = torch.int8
@@ -151,7 +153,10 @@ def test_mrv2_initializes_dsv4_cache_only_layer(
         *([cache_dtype] if device_type == AscendDeviceType.A5 else []),
     ]
     backing_storage = cache_components[0].untyped_storage().data_ptr()
-    assert all(component.untyped_storage().data_ptr() == backing_storage for component in cache_components)
+    assert all(
+        component.untyped_storage().data_ptr() == backing_storage
+        for component in cache_components
+    )
 
 
 class _RecordingDSAMetadataBuilder(AscendDSAMetadataBuilder):
@@ -241,7 +246,9 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
     cudagraph_mode,
     expected_input_tokens,
 ):
-    layer_names, specs, calls, attn_groups, kv_cache_config = _make_dsa_metadata_groups()
+    layer_names, specs, calls, attn_groups, kv_cache_config = (
+        _make_dsa_metadata_groups()
+    )
     block_tables = (
         torch.zeros((4, 1), dtype=torch.int32),
         torch.zeros((4, 1), dtype=torch.int32),
@@ -277,6 +284,7 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
             num_scheduled_tokens=torch.tensor([2, 3, 0, 0], dtype=torch.int32),
             seq_lens=torch.tensor([2, 3, 0, 0], dtype=torch.int32),
             seq_lens_np=np.array([2, 3, 0, 0], dtype=np.int32),
+            is_prefilling_np=np.array([True, True, False, False]),
             dcp_local_seq_lens=None,
             positions=torch.arange(8, dtype=torch.int32),
             attn_state=None,
@@ -304,3 +312,39 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
     ):
         assert calls[0][cache_name] is calls[1][cache_name]
         assert calls[1][cache_name]["first_group"] is True
+
+
+class _PrefillStateBuilder:
+    def build(self, common_prefix_len, common_attn_metadata):
+        assert common_prefix_len == 0
+        return common_attn_metadata.is_prefilling
+
+
+def test_build_attn_metadata_propagates_prefill_state():
+    attn_group = SimpleNamespace(
+        layer_names=["layer.0"],
+        get_metadata_builder=lambda _: _PrefillStateBuilder(),
+    )
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())],
+    )
+    is_prefilling = torch.tensor([True])
+
+    metadata = attn_utils.build_attn_metadata(
+        attn_groups=[[attn_group]],
+        num_reqs=1,
+        num_tokens=1,
+        query_start_loc_gpu=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        max_query_len=1,
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        max_seq_len=1,
+        block_tables=(torch.zeros((1, 1), dtype=torch.int32),),
+        slot_mappings=(torch.zeros(1, dtype=torch.int64),),
+        kv_cache_config=kv_cache_config,
+        is_prefilling=is_prefilling,
+        seq_lens_np=np.array([1], dtype=np.int32),
+        positions=torch.tensor([0], dtype=torch.int64),
+    )
+
+    assert metadata["layer.0"] is is_prefilling

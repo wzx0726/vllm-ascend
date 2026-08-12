@@ -23,9 +23,15 @@ import torch
 from vllm.compilation.cuda_graph import CUDAGraphOptions
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor, ForwardContext
+from vllm.v1.worker.gpu.spec_decode.autoregressive import (
+    cudagraph_utils as speculator_cudagraph_utils,
+)
 
 from tests.ut.base import TestBase
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionPCPImpl
+from vllm_ascend.attention.attention_v1 import (
+    AscendAttentionBackend,
+    AscendAttentionPCPImpl,
+)
 from vllm_ascend.attention.context_parallel.attention_cp import (
     AscendAttentionDCPImpl,
     AscendAttentionDCPMetadata,
@@ -54,6 +60,7 @@ from vllm_ascend.worker.v2 import aclgraph_utils as worker_aclgraph_utils
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
+from vllm_ascend.worker.v2.spec_decode.eagle import aclgraph as eagle_aclgraph
 
 
 def test_update_full_graph_params_dispatches_draft_metadata_by_keyword():
@@ -123,6 +130,7 @@ def test_update_full_graph_params_resolves_gqa_pcp_backend():
 
 def test_prepare_pcp_inputs_to_capture_uses_partitioned_persistent_buffers():
     events = []
+    capture_attn_state = object()
     input_buffers = AscendInputBuffers(
         max_num_reqs=4,
         max_num_tokens=8,
@@ -131,6 +139,7 @@ def test_prepare_pcp_inputs_to_capture_uses_partitioned_persistent_buffers():
     input_batch = SimpleNamespace(
         num_reqs_after_padding=4,
         num_tokens_after_padding=4,
+        attn_state=capture_attn_state,
     )
     block_table = torch.zeros(4, 2, dtype=torch.int32)
     slot_mapping = torch.arange(8, dtype=torch.int64).view(1, 8)
@@ -185,22 +194,144 @@ def test_prepare_pcp_inputs_to_capture_uses_partitioned_persistent_buffers():
     assert events == ["partition", "dummy_attn", "metadata"]
     make_dummy.assert_called_once_with(4, 4, input_buffers)
     assert model_state.prepare_attn.call_args.args[0] is input_batch
+    assert input_batch.attn_state is capture_attn_state
     assert model_state.prepare_attn.call_args.args[1] == CUDAGraphMode.NONE
-    assert model_state.prepare_attn.call_args.args[2][0].data_ptr() == (block_table.data_ptr())
-    assert model_state.prepare_attn.call_args.args[3].data_ptr() == (slot_mapping.data_ptr())
+    assert model_state.prepare_attn.call_args.args[2][0].data_ptr() == (
+        block_table.data_ptr()
+    )
+    assert model_state.prepare_attn.call_args.args[3].data_ptr() == (
+        slot_mapping.data_ptr()
+    )
     assert model_state.prepare_attn.call_args.kwargs["for_capture"] is True
     build_slot_mappings.assert_called_once()
     assert state.attn_metadata is attn_metadata
     assert state.slot_mappings is layer_slot_mappings
 
 
-def _make_model_acl_graph_manager(
-    pcp_manager,
-    cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
-):
+def test_prepare_pcp_speculator_inputs_to_capture_uses_global_batch() -> None:
+    input_buffers = AscendInputBuffers(
+        max_num_reqs=4,
+        max_num_tokens=8,
+        device=torch.device("cpu"),
+    )
+    input_batch = SimpleNamespace()
+    block_tables = MagicMock()
+    input_block_tables = (torch.zeros(4, 2, dtype=torch.int32),)
+    expanded_slot_mappings = torch.full(
+        (1, 8),
+        -1,
+        dtype=torch.int64,
+    )
+    block_tables.get_dummy_block_tables.return_value = input_block_tables
+
+    pcp_manager = MagicMock(spec=AscendPCPManager)
+    pcp_manager.get_dummy_slot_mappings.return_value = expanded_slot_mappings
+    model_state = MagicMock()
+    attn_metadata = {"layer": object()}
+    model_state.prepare_attn.return_value = attn_metadata
+    layer_slot_mappings = {"layer": expanded_slot_mappings[0]}
+
+    with (
+        patch.object(
+            AscendInputBatch,
+            "make_dummy",
+            return_value=input_batch,
+        ) as make_dummy,
+        patch.object(
+            worker_aclgraph_utils.cudagraph_utils,
+            "build_slot_mappings_by_layer",
+            return_value=layer_slot_mappings,
+        ),
+    ):
+        state = worker_aclgraph_utils.prepare_pcp_speculator_inputs_to_capture(
+            2,
+            4,
+            model_state,
+            input_buffers,
+            block_tables,
+            [[MagicMock()]],
+            MagicMock(),
+            pcp_manager,
+            full_cudagraph=True,
+        )
+
+    make_dummy.assert_called_once_with(2, 4, input_buffers)
+    block_tables.get_dummy_block_tables.assert_called_once_with(2)
+    pcp_manager.get_dummy_slot_mappings.assert_called_once_with(4)
+    pcp_manager.partition_batch.assert_not_called()
+    assert model_state.prepare_attn.call_args.args[0] is input_batch
+    assert model_state.prepare_attn.call_args.args[2] is input_block_tables
+    assert model_state.prepare_attn.call_args.args[3] is expanded_slot_mappings
+    assert model_state.prepare_attn.call_args.kwargs["for_capture"] is True
+    assert state.attn_metadata is attn_metadata
+    assert state.slot_mappings is layer_slot_mappings
+
+
+def test_pcp_draft_prefill_capture_temporarily_installs_preparation() -> None:
+    pcp_manager = AscendPCPManager.__new__(AscendPCPManager)
+    manager = eagle_aclgraph.EagleAclGraphManager.__new__(
+        eagle_aclgraph.EagleAclGraphManager
+    )
+    manager.speculator = SimpleNamespace(pcp_manager=pcp_manager)
+    manager.is_draft_model_prefill = True
+
+    original_prepare = speculator_cudagraph_utils.prepare_inputs_to_capture
+    prepared_state = object()
+
+    def capture_side_effect(*args, **kwargs):
+        installed_prepare = speculator_cudagraph_utils.prepare_inputs_to_capture
+        assert installed_prepare is not original_prepare
+        return installed_prepare(
+            2,
+            4,
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+            [],
+            MagicMock(),
+            full_cudagraph=True,
+        )
+
+    with (
+        patch.object(
+            eagle_aclgraph,
+            "communicator_switch",
+            side_effect=lambda: nullcontext(),
+        ),
+        patch.object(
+            eagle_aclgraph,
+            "model_capture_wrapper",
+            side_effect=lambda *args: nullcontext(),
+        ),
+        patch.object(
+            eagle_aclgraph,
+            "prepare_pcp_speculator_inputs_to_capture",
+            return_value=prepared_state,
+        ) as prepare_pcp,
+        patch.object(
+            eagle_aclgraph.SpeculatorCudaGraphManager,
+            "capture",
+            side_effect=capture_side_effect,
+        ),
+    ):
+        manager.capture(
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+            [],
+            MagicMock(),
+        )
+
+    assert speculator_cudagraph_utils.prepare_inputs_to_capture is original_prepare
+    assert prepare_pcp.call_args.args[7] is pcp_manager
+    assert prepare_pcp.call_args.kwargs["full_cudagraph"] is True
+
+
+def _make_model_acl_graph_manager(pcp_manager):
     manager = ModelAclGraphManager.__new__(ModelAclGraphManager)
     manager.model_runner = SimpleNamespace(pcp_manager=pcp_manager)
-    manager.cudagraph_mode = cudagraph_mode
+    manager.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
     return manager
 
 
@@ -223,7 +354,9 @@ def test_pcp_full_capture_temporarily_installs_and_restores_preparation():
     prepared_state = object()
 
     def capture_side_effect(*args, **kwargs):
-        installed_prepare = worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture
+        installed_prepare = (
+            worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture
+        )
         assert installed_prepare is not original_prepare
         return installed_prepare(
             2,
@@ -256,7 +389,10 @@ def test_pcp_full_capture_temporarily_installs_and_restores_preparation():
         result = _capture_with_mock_inputs(manager)
 
     assert result is prepared_state
-    assert worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture is original_prepare
+    assert (
+        worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture
+        is original_prepare
+    )
     assert prepare_pcp.call_args.args[7] is pcp_manager
     assert prepare_pcp.call_args.kwargs["full_cudagraph"] is True
 
@@ -267,7 +403,10 @@ def test_pcp_full_capture_restores_preparation_after_exception():
     original_prepare = worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture
 
     def capture_side_effect(*args, **kwargs):
-        assert worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture is not original_prepare
+        assert (
+            worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture
+            is not original_prepare
+        )
         raise RuntimeError("capture failed")
 
     with (
@@ -285,23 +424,21 @@ def test_pcp_full_capture_restores_preparation_after_exception():
     ):
         _capture_with_mock_inputs(manager)
 
-    assert worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture is original_prepare
+    assert (
+        worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture
+        is original_prepare
+    )
 
 
-@pytest.mark.parametrize(
-    ("use_pcp", "cudagraph_mode"),
-    [
-        (False, CUDAGraphMode.FULL_DECODE_ONLY),
-        (True, CUDAGraphMode.PIECEWISE),
-    ],
-)
-def test_capture_without_pcp_full_graph_keeps_native_preparation(use_pcp, cudagraph_mode):
-    pcp_manager = AscendPCPManager.__new__(AscendPCPManager) if use_pcp else None
-    manager = _make_model_acl_graph_manager(pcp_manager, cudagraph_mode)
+def test_non_pcp_capture_keeps_native_preparation():
+    manager = _make_model_acl_graph_manager(None)
     original_prepare = worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture
 
     def capture_side_effect(*args, **kwargs):
-        assert worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture is original_prepare
+        assert (
+            worker_aclgraph_utils.cudagraph_utils.prepare_inputs_to_capture
+            is original_prepare
+        )
 
     with (
         patch.object(
@@ -351,7 +488,10 @@ class TestACLGraphEntry(TestBase):
         input_addresses = [12345, 67890]
 
         entry = ACLGraphEntry(
-            batch_descriptor=batch_descriptor, aclgraph=mock_graph, output=mock_output, input_addresses=input_addresses
+            batch_descriptor=batch_descriptor,
+            aclgraph=mock_graph,
+            output=mock_output,
+            input_addresses=input_addresses,
         )
 
         self.assertEqual(entry.batch_descriptor, batch_descriptor)
@@ -394,13 +534,17 @@ class TestACLGraphWrapper(TestBase):
 
     @patch("vllm_ascend.compilation.acl_graph.current_platform")
     @patch("vllm_ascend.compilation.acl_graph.envs")
-    def test_initialization_with_default_options(self, mock_envs, mock_current_platform):
+    def test_initialization_with_default_options(
+        self, mock_envs, mock_current_platform
+    ):
         """Test ACLGraphWrapper initialization with default CUDAGraphOptions"""
         mock_envs.VLLM_LOGGING_LEVEL = "INFO"
         mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
 
         wrapper = ACLGraphWrapper(
-            runnable=self.mock_runnable, vllm_config=self.mock_vllm_config, runtime_mode=CUDAGraphMode.FULL
+            runnable=self.mock_runnable,
+            vllm_config=self.mock_vllm_config,
+            runtime_mode=CUDAGraphMode.FULL,
         )
 
         self.assertEqual(wrapper.runnable, self.mock_runnable)
@@ -442,7 +586,9 @@ class TestACLGraphWrapper(TestBase):
 
         with self.assertRaises(AssertionError):
             ACLGraphWrapper(
-                runnable=self.mock_runnable, vllm_config=self.mock_vllm_config, runtime_mode=CUDAGraphMode.NONE
+                runnable=self.mock_runnable,
+                vllm_config=self.mock_vllm_config,
+                runtime_mode=CUDAGraphMode.NONE,
             )
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
@@ -450,7 +596,11 @@ class TestACLGraphWrapper(TestBase):
     @patch("vllm_ascend.compilation.acl_graph.current_platform")
     @patch("vllm_ascend.compilation.acl_graph.envs")
     def test_call_with_none_runtime_mode(
-        self, mock_envs, mock_current_platform, mock_get_forward_context, mock_get_forward_context_2
+        self,
+        mock_envs,
+        mock_current_platform,
+        mock_get_forward_context,
+        mock_get_forward_context_2,
     ):
         """Test __call__ method when runtime mode is NONE"""
         mock_envs.VLLM_LOGGING_LEVEL = "INFO"
@@ -476,14 +626,20 @@ class TestACLGraphWrapper(TestBase):
     @patch("vllm_ascend.compilation.acl_graph.current_platform")
     @patch("vllm_ascend.compilation.acl_graph.envs")
     def test_call_with_mismatched_runtime_mode(
-        self, mock_envs, mock_current_platform, mock_get_forward_context, mock_get_forward_context_2
+        self,
+        mock_envs,
+        mock_current_platform,
+        mock_get_forward_context,
+        mock_get_forward_context_2,
     ):
         """Test __call__ method when runtime mode doesn't match wrapper mode"""
         mock_envs.VLLM_LOGGING_LEVEL = "INFO"
         mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
         mock_get_forward_context.return_value = self.mock_forward_context
         mock_get_forward_context_2.return_value = self.mock_forward_context
-        self.mock_forward_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE  # Different from FULL
+        self.mock_forward_context.cudagraph_runtime_mode = (
+            CUDAGraphMode.PIECEWISE
+        )  # Different from FULL
 
         wrapper = ACLGraphWrapper(
             runnable=self.mock_runnable,
@@ -559,7 +715,9 @@ class TestACLGraphWrapper(TestBase):
         # Verify graph capture happened
         mock_validate_cudagraph_capturing_enabled.assert_called_once()
         mock_torch.npu.NPUGraph.assert_called_once()
-        mock_torch.npu.graph.assert_called_once_with(mock_npu_graph, pool=self.mock_graph_pool)
+        mock_torch.npu.graph.assert_called_once_with(
+            mock_npu_graph, pool=self.mock_graph_pool
+        )
         self.mock_runnable.assert_called_once_with(test_tensor, "arg2")
 
         # Verify the entry was created and updated
@@ -779,7 +937,9 @@ class TestACLGraphWrapper(TestBase):
         with self.assertRaises(AssertionError) as context:
             wrapper(tensor2, "arg2")
 
-        self.assertIn("Input addresses for aclgraphs are different", str(context.exception))
+        self.assertIn(
+            "Input addresses for aclgraphs are different", str(context.exception)
+        )
 
     @patch("vllm_ascend.compilation.acl_graph.torch")
     @patch("vllm_ascend.compilation.acl_graph.validate_cudagraph_capturing_enabled")
@@ -858,7 +1018,9 @@ class TestACLGraphWrapper(TestBase):
         # Verify graph capture happened
         mock_validate_cudagraph_capturing_enabled.assert_called_once()
         mock_torch.npu.NPUGraph.assert_called_once()
-        mock_torch.npu.graph.assert_called_once_with(mock_npu_graph, pool=self.mock_graph_pool)
+        mock_torch.npu.graph.assert_called_once_with(
+            mock_npu_graph, pool=self.mock_graph_pool
+        )
 
         # Should return the original output (not weak ref) since weak_ref_output is not enabled
         self.assertEqual(result, "test_output")
@@ -932,7 +1094,9 @@ class TestACLGraphWrapper(TestBase):
         # Verify graph capture happened
         mock_validate_cudagraph_capturing_enabled.assert_called_once()
         mock_torch.npu.NPUGraph.assert_called_once()
-        mock_torch.npu.graph.assert_called_once_with(mock_npu_graph, pool=self.mock_graph_pool)
+        mock_torch.npu.graph.assert_called_once_with(
+            mock_npu_graph, pool=self.mock_graph_pool
+        )
 
         # Should return the weak ref output when weak_ref_output option is enabled
         self.assertEqual(result, "weak_ref_output")
@@ -943,7 +1107,12 @@ class TestACLGraphWrapper(TestBase):
     @patch("vllm_ascend.compilation.acl_graph.envs")
     @patch("vllm_ascend.compilation.acl_graph.logger")
     def test_call_capture_graph_with_debug_log(
-        self, mock_logger, mock_envs, mock_current_platform, mock_get_forward_context, mock_get_forward_context_2
+        self,
+        mock_logger,
+        mock_envs,
+        mock_current_platform,
+        mock_get_forward_context,
+        mock_get_forward_context_2,
     ):
         """Test __call__ method captures graph with debug logging enabled"""
         mock_envs.VLLM_LOGGING_LEVEL = "INFO"
@@ -972,14 +1141,18 @@ class TestACLGraphWrapper(TestBase):
             mock_torch.Tensor = torch.Tensor
 
             # Mock weak_ref_tensors
-            with patch("vllm_ascend.compilation.acl_graph.weak_ref_tensors") as mock_weak_ref_tensors:
+            with patch(
+                "vllm_ascend.compilation.acl_graph.weak_ref_tensors"
+            ) as mock_weak_ref_tensors:
                 # Mock weak_ref_tensors to simulate the actual behavior:
                 # 1. First call (inside the graph context) should return "inner_output"
                 # 2. Second call (for entry.output) should return "weak_ref_output"
                 mock_weak_ref_tensors.side_effect = ["inner_output", "weak_ref_output"]
 
                 # Mock validate_cudagraph_capturing_enabled
-                with patch("vllm_ascend.compilation.acl_graph.validate_cudagraph_capturing_enabled"):
+                with patch(
+                    "vllm_ascend.compilation.acl_graph.validate_cudagraph_capturing_enabled"
+                ):
                     wrapper = ACLGraphWrapper(
                         runnable=self.mock_runnable,
                         vllm_config=self.mock_vllm_config,
@@ -1061,7 +1234,9 @@ class TestSleepGraphParams(TestBase):
         with (
             patch("vllm_ascend.compilation.acl_graph._graph_params", graph_params),
             patch("vllm_ascend.compilation.acl_graph._draft_graph_params", None),
-            patch("vllm_ascend.compilation.acl_graph._draft_graph_prefill_params", None),
+            patch(
+                "vllm_ascend.compilation.acl_graph._draft_graph_prefill_params", None
+            ),
         ):
             AclGraphSleepWakeupManager.clear_all_attention_workspaces()
 
@@ -1081,8 +1256,13 @@ class TestSleepGraphParams(TestBase):
         )
         with (
             patch("vllm_ascend.compilation.acl_graph._graph_params", empty_params),
-            patch("vllm_ascend.compilation.acl_graph._draft_graph_params", empty_params),
-            patch("vllm_ascend.compilation.acl_graph._draft_graph_prefill_params", empty_params),
+            patch(
+                "vllm_ascend.compilation.acl_graph._draft_graph_params", empty_params
+            ),
+            patch(
+                "vllm_ascend.compilation.acl_graph._draft_graph_prefill_params",
+                empty_params,
+            ),
             patch("vllm_ascend.compilation.acl_graph._acl_graph_wrappers", [wrapper]),
         ):
             AclGraphSleepWakeupManager.reset_all_graph_params()
@@ -1154,10 +1334,24 @@ class TestDCPGraphParams(TestBase):
         block_tables = torch.zeros(2, 5, dtype=torch.long)
 
         decode = AscendMLADCPDecodeMetadata(
-            input_positions, block_table, seq_lens, max_seq_lens, seq_lens_list, cp_seq_len=cp_seq_len
+            input_positions,
+            block_table,
+            seq_lens,
+            max_seq_lens,
+            seq_lens_list,
+            cp_seq_len=cp_seq_len,
         )
         metadata = AscendMLAMetadata(
-            8, slot_mapping, query_start_loc, seq_lens, seq_lens, block_tables, 4, 4, 0, decode=decode
+            8,
+            slot_mapping,
+            query_start_loc,
+            seq_lens,
+            seq_lens,
+            block_tables,
+            4,
+            4,
+            0,
+            decode=decode,
         )
         forward_context = MagicMock()
         forward_context.attn_metadata = {"attn_layer_0": metadata}
@@ -1263,6 +1457,8 @@ class TestDCPGraphParams(TestBase):
         )
 
         with patch("torch_npu._C._npu_setStream", return_value=None):
-            AscendAttentionDCPImpl.update_graph_params(self.update_stream, forward_context, 4, None)
+            AscendAttentionDCPImpl.update_graph_params(
+                self.update_stream, forward_context, 4, None
+            )
 
         _mock_graph_task_end.assert_called_once()

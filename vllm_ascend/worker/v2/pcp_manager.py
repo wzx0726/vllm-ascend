@@ -58,9 +58,7 @@ class AscendPCPManager(PCPManager):
                 "Ascend MRV2 PCP does not support encoder-decoder models yet."
             )
         if supports_mm_inputs:
-            raise NotImplementedError(
-                "Ascend MRV2 PCP does not support MM inputs yet."
-            )
+            raise NotImplementedError("Ascend MRV2 PCP does not support MM inputs yet.")
         if vllm_config.lora_config is not None:
             raise NotImplementedError("Ascend MRV2 PCP does not support LoRA yet.")
 
@@ -100,27 +98,42 @@ class AscendPCPManager(PCPManager):
         )
         self.vllm_config = vllm_config
 
-    def partition_batch(self, input_batch: AscendInputBatch) -> AscendInputBatch:
-        """Partition the batch and update Ascend-specific local metadata."""
+    def partition_batch(
+        self,
+        input_batch: AscendInputBatch,
+    ) -> AscendInputBatch:
+        """Reuse upstream PCP partitioning and refresh Ascend-only metadata."""
         assert self.vllm_config is not None
         graph_num_reqs = input_batch.num_reqs_after_padding
         graph_num_tokens = input_batch.num_tokens_after_padding
         is_decode_only = not np.any(input_batch.is_prefilling_np)
 
+        upstream_input_batch = input_batch
+        if input_batch.num_draft_tokens > 0:
+            # The upstream implementation only uses num_draft_tokens to reject
+            # speculative decoding, then clears the two draft fields on the
+            # returned rank-local batch. Present the same post-guard view while
+            # retaining the real global batch for proposal and sampling.
+            upstream_input_batch = replace(
+                input_batch,
+                num_draft_tokens=0,
+                num_draft_tokens_per_req=None,
+            )
 
-        local_batch = super().partition_batch(input_batch)
+        try:
+            local_batch = super().partition_batch(upstream_input_batch)
+        finally:
+            self._global_batch = input_batch
+
         assert isinstance(local_batch, AscendInputBatch)
-
-        local_seq_lens_np = local_batch.num_computed_tokens_np + local_batch.num_scheduled_tokens
-
+        local_seq_lens_np = (
+            local_batch.num_computed_tokens_np + local_batch.num_scheduled_tokens
+        )
         if is_decode_only:
-            # PCP partitioning must not change the semantic attention state of
-            # a decode-only batch. In particular, dummy sequence lengths used
-            # for full-decode graph capture look like a fresh prefill to
-            # build_attn_state(), even though make_dummy() selected decode.
             local_batch.attn_state = input_batch.attn_state
             if local_batch.attn_state is None:
                 local_batch.attn_state = AscendAttentionState.DecodeOnly
+
             return self._pad_decode_batch_for_full_graph(
                 local_batch,
                 graph_num_reqs,
@@ -137,6 +150,48 @@ class AscendPCPManager(PCPManager):
         )
         local_batch.seq_lens_np = local_seq_lens_np
         return local_batch
+
+    def prepare_speculator_attn(
+        self,
+        input_batch: AscendInputBatch,
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        """Build the global KV layout consumed by a PCP speculator."""
+        if input_batch is not self._global_batch:
+            raise RuntimeError(
+                "PCP speculative proposal must use the restored global batch."
+            )
+        assert self._block_tables is not None
+        block_tables = self._block_tables.gather_block_tables(
+            input_batch.idx_mapping,
+            num_reqs_padded=input_batch.num_reqs_after_padding,
+        )
+        assert self._global_batch_slot_mappings is not None
+        num_tokens = input_batch.num_tokens_after_padding
+        if num_tokens > input_batch.num_tokens:
+            self._global_batch_slot_mappings[
+                :,
+                input_batch.num_tokens : num_tokens,
+            ].fill_(PAD_SLOT_ID)
+        global_slot_mappings = self._global_batch_slot_mappings[:, :num_tokens]
+
+        assert self._gathered_kv_slot_mappings is not None
+        num_expanded_tokens = num_tokens * self.pcp_world_size
+        if num_expanded_tokens > self._gathered_kv_slot_mappings.shape[1]:
+            raise RuntimeError(
+                "PCP speculator slot mapping exceeds the persistent buffer "
+                f"capacity: {num_expanded_tokens} > "
+                f"{self._gathered_kv_slot_mappings.shape[1]}."
+            )
+        expanded_slot_mappings = self._gathered_kv_slot_mappings[
+            :, :num_expanded_tokens
+        ]
+        for rank in range(self.pcp_world_size):
+            rank_start = rank * num_tokens
+            expanded_slot_mappings[
+                :,
+                rank_start : rank_start + num_tokens,
+            ].copy_(global_slot_mappings)
+        return block_tables, expanded_slot_mappings
 
     def _pad_decode_batch_for_full_graph(
         self,
@@ -157,14 +212,16 @@ class AscendPCPManager(PCPManager):
 
         num_padding_reqs = graph_num_reqs - num_reqs
         num_padding_tokens = graph_num_tokens - num_tokens
-        uses_per_request_padding = num_padding_reqs == num_padding_tokens
-        uses_single_fia_dummy = (
-            num_padding_reqs == 1 and num_padding_tokens > 0
+        decode_query_len = getattr(self.vllm_config, "num_speculative_tokens", 0) + 1
+        uses_per_request_padding = (
+            num_padding_tokens == num_padding_reqs * decode_query_len
         )
+        uses_single_fia_dummy = num_padding_reqs == 1 and num_padding_tokens > 0
         if not (uses_per_request_padding or uses_single_fia_dummy):
             raise RuntimeError(
-                "PCP FULL_DECODE_ONLY requires either one token per padded "
-                "request or one FIA dummy request for all padding tokens: "
+                "PCP FULL_DECODE_ONLY requires either a uniform decode query "
+                "per padded request or one FIA dummy request for all padding "
+                "tokens: "
                 f"{num_padding_tokens} tokens for {num_padding_reqs} requests."
             )
 
@@ -172,6 +229,7 @@ class AscendPCPManager(PCPManager):
         # buffers, while PCP attention metadata uses the rank-local buffers.
         # Clear both views so a smaller replay cannot observe stale padding
         # left by a previously larger decode batch.
+        # Clear the full image buffer to prevent dirty data from polluting the next image.
         global_batch = self._global_batch
         assert global_batch is not None
         global_batch.input_ids[num_tokens:graph_num_tokens].zero_()
@@ -207,21 +265,21 @@ class AscendPCPManager(PCPManager):
             graph_num_tokens,
             dtype=np.int32,
         )
-        query_start_loc_buffer_np[: num_reqs + 1] = (
-            local_batch.query_start_loc_np
-        )
+        query_start_loc_buffer_np[: num_reqs + 1] = local_batch.query_start_loc_np
         if uses_per_request_padding:
-            query_start_loc_buffer_np[
-                num_reqs + 1 : graph_num_reqs + 1
-            ] = num_tokens + np.arange(
-                1,
-                num_padding_reqs + 1,
-                dtype=np.int32,
+            query_start_loc_buffer_np[num_reqs + 1 : graph_num_reqs + 1] = (
+                num_tokens
+                + decode_query_len
+                * np.arange(
+                    1,
+                    num_padding_reqs + 1,
+                    dtype=np.int32,
+                )
             )
         else:
-            query_start_loc_buffer_np[
-                num_reqs + 1 : graph_num_reqs + 1
-            ] = graph_num_tokens
+            query_start_loc_buffer_np[num_reqs + 1 : graph_num_reqs + 1] = (
+                graph_num_tokens
+            )
         async_copy_to_gpu(
             query_start_loc_buffer_np,
             out=input_buffers.query_start_loc,
@@ -282,5 +340,7 @@ class AscendPCPManager(PCPManager):
                 f"{graph_num_expanded_tokens} > "
                 f"{self._gathered_kv_slot_mappings.shape[1]}."
             )
-        self._gathered_kv_slot_mappings[:, num_expanded_tokens:graph_num_expanded_tokens].fill_(PAD_SLOT_ID)
+        self._gathered_kv_slot_mappings[
+            :, num_expanded_tokens:graph_num_expanded_tokens
+        ].fill_(PAD_SLOT_ID)
         return self._gathered_kv_slot_mappings[:, :graph_num_expanded_tokens]

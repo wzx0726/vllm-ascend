@@ -129,7 +129,6 @@ class NPUModelRunner(GPUModelRunner):
         set_potential_max_tokens(vllm_config)
         parallel_config = vllm_config.parallel_config
 
-
         with torch_cuda_wrapper():
             super().__init__(vllm_config, device)
 
@@ -142,7 +141,9 @@ class NPUModelRunner(GPUModelRunner):
         self.eplb = AscendEPLBController(
             parallel_config,
             device,
-            load_collection_phase=(load_collection_phase if parallel_config.enable_eplb else "all"),
+            load_collection_phase=(
+                load_collection_phase if parallel_config.enable_eplb else "all"
+            ),
         )
 
         self.update_stream = None
@@ -201,7 +202,13 @@ class NPUModelRunner(GPUModelRunner):
         self.decode_query_len = self.num_speculative_steps + 1
         # Set _mc2_tokens_capacity and _reserved_mc2_mask for MoE communication optimization.
         # TODO: remove set_cos_and_sin (together with update_cos_sin) when mla can properly handle cos/sin internally
-        set_cos_and_sin(vllm_config, self.max_num_reqs, self.decode_query_len, self.dtype, self.device)
+        set_cos_and_sin(
+            vllm_config,
+            self.max_num_reqs,
+            self.decode_query_len,
+            self.dtype,
+            self.device,
+        )
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.decode_query_len)
         set_mc2_mask(vllm_config, self.device)
         set_potential_max_tokens(vllm_config)
@@ -211,6 +218,8 @@ class NPUModelRunner(GPUModelRunner):
             super().initialize_kv_cache(kv_cache_config)
             if self.pcp_manager is not None:
                 assert isinstance(self.pcp_manager, AscendPCPManager)
+                if self.speculator is not None:
+                    self.speculator.pcp_manager = self.pcp_manager
                 self.pcp_manager.vllm_config = self.vllm_config
 
     @torch.inference_mode()
@@ -235,7 +244,9 @@ class NPUModelRunner(GPUModelRunner):
         if (
             self.is_last_pp_rank
             and state is not None
-            and _flashcomm_enabled(self.vllm_config, state.input_batch.num_tokens_after_padding)
+            and _flashcomm_enabled(
+                self.vllm_config, state.input_batch.num_tokens_after_padding
+            )
         ):
             num_tokens = state.input_batch.num_tokens
             assert state.hidden_states is not None
@@ -272,7 +283,9 @@ class NPUModelRunner(GPUModelRunner):
                 and select_moe_comm_method(mc2_tokens_capacity, self.vllm_config)
                 in {MoECommType.MC2, MoECommType.FUSED_MC2}
             ):
-                self._dummy_run(mc2_tokens_capacity, skip_attn=True, skip_eplb=True, is_profile=True)
+                self._dummy_run(
+                    mc2_tokens_capacity, skip_attn=True, skip_eplb=True, is_profile=True
+                )
             super().profile_run()
 
     def prepare_inputs(
@@ -300,7 +313,8 @@ class NPUModelRunner(GPUModelRunner):
         if scheduler_output.scheduled_spec_decode_tokens:
             num_valid_tokens = np.array(
                 [
-                    num_tokens - len(scheduler_output.scheduled_spec_decode_tokens.get(i, []))
+                    num_tokens
+                    - len(scheduler_output.scheduled_spec_decode_tokens.get(i, []))
                     for num_tokens, i in zip(num_scheduled_tokens, req_ids)
                 ],
                 dtype=np.int32,
@@ -325,9 +339,13 @@ class NPUModelRunner(GPUModelRunner):
             total_num_draft_tokens = 0
             total_num_logits = num_reqs
             cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
-            cu_num_logits = torch.arange(num_reqs + 1, device=self.device, dtype=torch.int32)
+            cu_num_logits = torch.arange(
+                num_reqs + 1, device=self.device, dtype=torch.int32
+            )
             expanded_idx_mapping = idx_mapping
-            expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
+            expanded_local_pos = torch.zeros(
+                num_reqs, dtype=torch.int32, device=self.device
+            )
         else:
             num_draft_tokens_per_req = np.fromiter(
                 (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
@@ -375,7 +393,9 @@ class NPUModelRunner(GPUModelRunner):
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
         prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
-        num_computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens[idx_mapping_np]
+        num_computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens[
+            idx_mapping_np
+        ]
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
         batch_has_prefill = bool(np.any(is_prefilling_np))
         self.eplb.set_batch_phase(batch_has_prefill)
@@ -478,7 +498,9 @@ class NPUModelRunner(GPUModelRunner):
             attn_state=attn_state,
         )
 
-        input_batch = vllm_model_runner.pcp.maybe_partition_pcp_batch(self.pcp_manager, input_batch)
+        input_batch = vllm_model_runner.pcp.maybe_partition_pcp_batch(
+            self.pcp_manager, input_batch
+        )
 
         # For mla/sfa, update cos/sin. Here is for execute_model.
         update_cos_sin(input_batch.positions)
@@ -537,17 +559,23 @@ class NPUModelRunner(GPUModelRunner):
             self.num_computed_tokens_event.synchronize()
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
                 req_index = self.req_states.req_id_to_index[req_id]
-                self.req_states.num_computed_tokens_cpu[req_index] = self.num_computed_tokens_cpu[req_index]
+                self.req_states.num_computed_tokens_cpu[req_index] = (
+                    self.num_computed_tokens_cpu[req_index]
+                )
         else:
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
                 req_index = self.req_states.req_id_to_index[req_id]
-                self.req_states.num_computed_tokens_cpu[req_index] = self.req_states.num_computed_tokens_np[req_index]
+                self.req_states.num_computed_tokens_cpu[req_index] = (
+                    self.req_states.num_computed_tokens_np[req_index]
+                )
 
         # update seq_lens_cpu
         for i, req_id in enumerate(req_ids):  # type: ignore
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens = self.req_states.num_computed_tokens_cpu[req_index]
-            self.input_buffers.seq_lens_cpu[i] = num_computed_tokens + num_scheduled_tokens[req_id]
+            self.input_buffers.seq_lens_cpu[i] = (
+                num_computed_tokens + num_scheduled_tokens[req_id]
+            )
 
     def _pad_query_start_loc_for_fia(
         self,
@@ -567,7 +595,9 @@ class NPUModelRunner(GPUModelRunner):
         if cudagraph_runtime_mode == CUDAGraphMode.FULL:
             num_reqs_padded = num_reqs
         else:
-            num_reqs_padded = batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs
+            num_reqs_padded = (
+                batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs
+            )
 
         if num_tokens_padded == num_reqs_padded * self.decode_query_len:
             # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
@@ -575,7 +605,8 @@ class NPUModelRunner(GPUModelRunner):
 
             last_loc = query_start_loc_np[num_reqs]
             query_start_loc_np[num_reqs + 1 : num_reqs_padded + 1] = (
-                np.arange(1, num_reqs_padded + 1 - num_reqs) * self.decode_query_len + last_loc
+                np.arange(1, num_reqs_padded + 1 - num_reqs) * self.decode_query_len
+                + last_loc
             )
         else:
             # Mixed-batch case: num_reqs must equal num_reqs_padded
