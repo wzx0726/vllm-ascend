@@ -25,15 +25,12 @@ from vllm.config import VllmConfig
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
-from vllm.v1.worker.gpu.pcp_manager import PCPManager, PCPManagerRegistry
+from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
-
-
-ASCEND_PCP_MANAGER_NAME = "ascend"
 
 
 class AscendPCPManager(PCPManager):
@@ -44,18 +41,43 @@ class AscendPCPManager(PCPManager):
         vllm_config: VllmConfig,
         supports_mm_inputs: bool,
     ) -> None:
-        """Allow the Ascend MRV2 GQA PCP implementation."""
-        if vllm_config.parallel_config.prefill_context_parallel_size <= 1:
+        """Validate the Ascend MRV2 MLA and GQA PCP implementations."""
+        parallel_config = vllm_config.parallel_config
+        model_config = vllm_config.model_config
+        if parallel_config.prefill_context_parallel_size <= 1:
             return
 
+        if parallel_config.decode_context_parallel_size > 1:
+            raise NotImplementedError(
+                "Ascend MRV2 does not support PCP and DCP simultaneously yet."
+            )
+        if parallel_config.pipeline_parallel_size > 1:
+            raise NotImplementedError("Ascend MRV2 PCP does not support PP yet.")
+        if model_config.is_encoder_decoder:
+            raise NotImplementedError(
+                "Ascend MRV2 PCP does not support encoder-decoder models yet."
+            )
+        if supports_mm_inputs:
+            raise NotImplementedError(
+                "Ascend MRV2 PCP does not support MM inputs yet."
+            )
+        if vllm_config.lora_config is not None:
+            raise NotImplementedError("Ascend MRV2 PCP does not support LoRA yet.")
 
+        if not model_config.use_mla:
+            text_config = model_config.hf_text_config
+            if text_config.num_attention_heads <= text_config.num_key_value_heads:
+                raise NotImplementedError(
+                    "Ascend MRV2 GQA PCP requires num_attention_heads "
+                    "to be greater than num_key_value_heads."
+                )
 
     def __init__(
         self,
         pcp_world_size: int,
         pcp_rank: int,
         device: torch.device,
-        vllm_config: VllmConfig,
+        vllm_config: VllmConfig | None = None,
         req_states: RequestState | None = None,
         max_num_reqs: int | None = None,
         max_num_tokens: int | None = None,
@@ -262,10 +284,3 @@ class AscendPCPManager(PCPManager):
             )
         self._gathered_kv_slot_mappings[:, num_expanded_tokens:graph_num_expanded_tokens].fill_(PAD_SLOT_ID)
         return self._gathered_kv_slot_mappings[:, :graph_num_expanded_tokens]
-
-
-PCPManagerRegistry.register_manager(
-    ASCEND_PCP_MANAGER_NAME,
-    "vllm_ascend.worker.v2.pcp_manager",
-    "AscendPCPManager",
-)

@@ -56,10 +56,7 @@ from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
-from vllm_ascend.worker.v2.pcp_manager import (
-    ASCEND_PCP_MANAGER_NAME,
-    AscendPCPManager,
-)
+from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.sp_utils import (
     _all_gather_hidden_states_and_aux,
     _flashcomm_enabled,
@@ -120,7 +117,9 @@ class NPUModelRunner(GPUModelRunner):
 
     execute_model_state: ExecuteModelState | None
 
-    pcp_manager_name = ASCEND_PCP_MANAGER_NAME
+    @property
+    def pcp_manager_cls(self) -> type[AscendPCPManager]:
+        return AscendPCPManager
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Ascend-specific configurations
@@ -212,6 +211,7 @@ class NPUModelRunner(GPUModelRunner):
             super().initialize_kv_cache(kv_cache_config)
             if self.pcp_manager is not None:
                 assert isinstance(self.pcp_manager, AscendPCPManager)
+                self.pcp_manager.vllm_config = self.vllm_config
 
     @torch.inference_mode()
     def execute_model(
