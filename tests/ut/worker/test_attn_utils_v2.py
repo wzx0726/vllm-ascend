@@ -277,6 +277,7 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
             num_scheduled_tokens=torch.tensor([2, 3, 0, 0], dtype=torch.int32),
             seq_lens=torch.tensor([2, 3, 0, 0], dtype=torch.int32),
             seq_lens_np=np.array([2, 3, 0, 0], dtype=np.int32),
+            is_prefilling_np=np.array([True, True, False, False]),
             dcp_local_seq_lens=None,
             positions=torch.arange(8, dtype=torch.int32),
             attn_state=None,
@@ -306,20 +307,16 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
         assert calls[1][cache_name]["first_group"] is True
 
 
-class _OneTokenPrefillBuilder:
+class _PrefillStateBuilder:
     def build(self, common_prefix_len, common_attn_metadata):
         assert common_prefix_len == 0
-        return attn_utils.split_decodes_and_prefills(
-            common_attn_metadata,
-            treat_short_extends_as_decodes=False,
-        )
+        return common_attn_metadata.is_prefilling
 
 
-def test_build_attn_metadata_keeps_one_token_prefill_phase():
-    builder = _OneTokenPrefillBuilder()
+def test_build_attn_metadata_propagates_prefill_state():
     attn_group = SimpleNamespace(
         layer_names=["layer.0"],
-        get_metadata_builder=lambda _: builder,
+        get_metadata_builder=lambda _: _PrefillStateBuilder(),
     )
     kv_cache_config = SimpleNamespace(
         kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())],
@@ -343,9 +340,4 @@ def test_build_attn_metadata_keeps_one_token_prefill_phase():
         positions=torch.tensor([0], dtype=torch.int64),
     )
 
-    assert metadata["layer.0"] == (
-        0,  # num_decodes
-        1,  # num_prefills
-        0,  # num_decode_tokens
-        1,  # num_prefill_tokens
-    )
+    assert metadata["layer.0"] is is_prefilling
