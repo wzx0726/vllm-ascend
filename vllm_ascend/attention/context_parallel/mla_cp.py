@@ -2,7 +2,6 @@ from typing import ClassVar, Optional, Tuple, TypeVar
 
 import numpy as np
 import torch
-import os
 import torch_npu
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -63,9 +62,8 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     AscendPCPMetadata,
     CPChunkedContextMetadata,
     _npu_attention_update,
-    _process_attn_out_lse,
-    _npu_update_dycp_attn,
     _npu_update_dycp_attn_fused,
+    _process_attn_out_lse,
 )
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import get_draft_graph_params, get_graph_params, update_graph_params_workspaces
@@ -134,16 +132,22 @@ class AscendMlaCPMetadataBuilder(AscendMLAMetadataBuilder):
         metadata_cls.slot_mapping = self.slot_mapping
         metadata_cls.num_dycp_reqs = common_attn_metadata.num_dycp_reqs
         mask_value = int(common_attn_metadata.num_dycp_reqs)
-        tmp_mask = torch.tensor(
-            mask_value,
-            dtype=torch.int32,
-            device=self.dycp_mask_num.device,
+        self.dycp_mask_num.fill_(mask_value)
+
+        metadata_cls.dycp_mask = self.dycp_mask_num
+        dycp_metadata, dp_metadata = split_attn_metadata(
+            metadata_cls,
+            metadata_cls.num_dycp_reqs,
+            self.dycp_size,
+            self.chunked_prefill_workspace_size,
+            self.block_size,
+            common_attn_metadata,
+            self.dcp_size,
+            self.pcp_size,
+            self.dycp_size,
+            self.cp_virtual_block_size,
+            self.cp_local_block_size,
         )
-
-        self.dycp_mask_num.copy_(tmp_mask)
-
-        metadata_cls.dycp_mask = self.dycp_mask_num 
-        dycp_metadata, dp_metadata = split_attn_metadata(metadata_cls, metadata_cls.num_dycp_reqs, self.dycp_size, self.chunked_prefill_workspace_size, self.block_size, common_attn_metadata, self.dcp_size, self.pcp_size, self.dycp_size, self.cp_virtual_block_size, self.cp_local_block_size)
         metadata_cls.dp_metadata = dp_metadata
         metadata_cls.dycp_metadata = dycp_metadata
         return metadata_cls
@@ -387,9 +391,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
             self.dycp_rank = 0
 
         self._dycp_hccl_group_name: str | None = None
-        # DYCP FUSED OP END
 
-    # DYCP FUSED OP BEGIN: eager-only capability and communicator helpers.
     def _get_dycp_hccl_group_name(self) -> str:
         if self._dycp_hccl_group_name is None:
             device_group = get_dycp_group().device_group
@@ -1189,16 +1191,13 @@ class AscendMlaCPImpl(AscendMLAImpl):
 
         # Update out&lse
         if self.dycp_size > 1:
-            
-            #dycp_attn_output
             attn_output = _npu_update_dycp_attn_fused(
                 attn_output=attn_output,
                 softmax_lse=softmax_lse,
                 group_name=self._get_dycp_hccl_group_name(),
                 group_size=self.dycp_size,
-                mask_num=attn_metadata.dycp_mask
+                mask_num=attn_metadata.dycp_mask,
             )
-            
             return self._v_up_proj(attn_output)
         elif self.dycp_size == 1:
             attn_out_lse = _process_attn_out_lse(attn_output, softmax_lse)
