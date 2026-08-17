@@ -2,6 +2,7 @@ from typing import ClassVar, Optional, Tuple, TypeVar
 
 import numpy as np
 import torch
+import os
 import torch_npu
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -64,6 +65,7 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     _npu_attention_update,
     _process_attn_out_lse,
     _npu_update_dycp_attn,
+    _npu_update_dycp_attn_fused,
 )
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import get_draft_graph_params, get_graph_params, update_graph_params_workspaces
@@ -105,6 +107,12 @@ class AscendMlaCPMetadataBuilder(AscendMLAMetadataBuilder):
         self.common_pcp_size = self.dycp_size if self.dycp_size > 1 else self.pcp_size
         self.common_pcp_rank = self.dycp_rank if self.dycp_size > 1 else self.pcp_rank
 
+        self.dycp_mask_num = torch.zeros(
+            (),
+            dtype=torch.int32,
+            device=device,
+        )
+
         self.cp_local_block_size = vllm_config.parallel_config.cp_kv_cache_interleave_size
         self.cp_virtual_block_size = self.cp_local_block_size * self.dcp_size * self.common_pcp_size
         self.block_size = (self.block_size * self.cp_virtual_block_size) // np.gcd(
@@ -125,6 +133,16 @@ class AscendMlaCPMetadataBuilder(AscendMLAMetadataBuilder):
             self.slot_mapping[self.num_decode_tokens : self.num_decode_tokens * self.common_pcp_size].fill_(-1)
         metadata_cls.slot_mapping = self.slot_mapping
         metadata_cls.num_dycp_reqs = common_attn_metadata.num_dycp_reqs
+        mask_value = int(common_attn_metadata.num_dycp_reqs)
+        tmp_mask = torch.tensor(
+            mask_value,
+            dtype=torch.int32,
+            device=self.dycp_mask_num.device,
+        )
+
+        self.dycp_mask_num.copy_(tmp_mask)
+
+        metadata_cls.dycp_mask = self.dycp_mask_num 
         dycp_metadata, dp_metadata = split_attn_metadata(metadata_cls, metadata_cls.num_dycp_reqs, self.dycp_size, self.chunked_prefill_workspace_size, self.block_size, common_attn_metadata, self.dcp_size, self.pcp_size, self.dycp_size, self.cp_virtual_block_size, self.cp_local_block_size)
         metadata_cls.dp_metadata = dp_metadata
         metadata_cls.dycp_metadata = dycp_metadata
@@ -367,6 +385,18 @@ class AscendMlaCPImpl(AscendMLAImpl):
         except AssertionError:
             self.dycp_size = 1
             self.dycp_rank = 0
+
+        self._dycp_hccl_group_name: str | None = None
+        # DYCP FUSED OP END
+
+    # DYCP FUSED OP BEGIN: eager-only capability and communicator helpers.
+    def _get_dycp_hccl_group_name(self) -> str:
+        if self._dycp_hccl_group_name is None:
+            device_group = get_dycp_group().device_group
+            local_rank = torch.distributed.get_rank(group=device_group)
+            backend = device_group._get_backend(torch.device("npu"))
+            self._dycp_hccl_group_name = backend.get_hccl_comm_name(local_rank)
+        return self._dycp_hccl_group_name
 
     @staticmethod
     def update_graph_params(
@@ -1158,15 +1188,17 @@ class AscendMlaCPImpl(AscendMLAImpl):
             softmax_lse = softmax_lse.permute(0, 2, 1, 3).reshape(B_lse * Q_S, N_lse, 1)
 
         # Update out&lse
-        if self.dycp_size > 1 and num_dycp_reqs > 0:
-            dycp_attn_output = _npu_update_dycp_attn(
-                num_dycp_reqs, attn_output, softmax_lse
+        if self.dycp_size > 1:
+            
+            #dycp_attn_output
+            attn_output = _npu_update_dycp_attn_fused(
+                attn_output=attn_output,
+                softmax_lse=softmax_lse,
+                group_name=self._get_dycp_hccl_group_name(),
+                group_size=self.dycp_size,
+                mask_num=attn_metadata.dycp_mask
             )
-            # Only the leading DYCP requests need cross-rank merging. Keep any
-            # trailing DP requests in their original positions for sampling.
-            attn_output[:num_dycp_reqs].copy_(
-                dycp_attn_output.to(attn_output.dtype)
-            )
+            
             return self._v_up_proj(attn_output)
         elif self.dycp_size == 1:
             attn_out_lse = _process_attn_out_lse(attn_output, softmax_lse)
