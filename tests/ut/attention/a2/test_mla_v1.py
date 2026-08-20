@@ -135,6 +135,7 @@ def test_mla_pcp_metadata_keeps_expanded_slot_mapping() -> None:
     builder = AscendMLAPCPMetadataBuilder.__new__(AscendMLAPCPMetadataBuilder)
     builder.pcp_size = 2
     builder.pcp_rank = 1
+    builder.set_pcp_enabled(True)
 
     with patch.object(AscendMLAMetadataBuilder, "build", return_value=metadata):
         result = builder.build(0, common_metadata)
@@ -144,6 +145,63 @@ def test_mla_pcp_metadata_keeps_expanded_slot_mapping() -> None:
     assert result.pcp_local_prefill_start == 3
     assert result.pcp_local_prefill_end == 5
     assert result.attn_state == AscendAttentionState.ChunkedPrefill
+
+
+def test_mla_pcp_builder_can_emit_ordinary_metadata() -> None:
+    builder = AscendMLAPCPMetadataBuilder.__new__(AscendMLAPCPMetadataBuilder)
+    builder.set_pcp_enabled(False)
+    common_metadata = SimpleNamespace(slot_mapping=torch.tensor([1, 2]))
+    metadata = MagicMock(spec=AscendMLAMetadata)
+
+    with patch.object(AscendMLAMetadataBuilder, "build", return_value=metadata):
+        result = builder.build(0, common_metadata)
+
+    assert result is metadata
+    assert builder.metadata_cls is AscendMLAMetadata
+
+
+def test_mla_pcp_impl_delegates_for_ordinary_metadata() -> None:
+    impl = AscendMLAPCPImpl.__new__(AscendMLAPCPImpl)
+    metadata = MagicMock(spec=AscendMLAMetadata)
+
+    with patch.object(
+        AscendMLAImpl,
+        "_get_num_prefill_kv_tokens",
+        return_value=3,
+    ) as ordinary_num_prefill_tokens:
+        assert impl._get_num_prefill_kv_tokens(metadata) == 3
+
+    ordinary_num_prefill_tokens.assert_called_once_with(metadata)
+
+    kv = torch.empty((3, 2))
+    cos = torch.empty((3, 1))
+    sin = torch.empty((3, 1))
+    kv_cache = (torch.empty(1), torch.empty(1))
+    slots = torch.empty(3, dtype=torch.int64)
+    expected = (torch.empty(1), torch.empty(1))
+    with patch.object(
+        AscendMLAImpl,
+        "exec_kv_prefill",
+        return_value=expected,
+    ) as ordinary_exec_kv_prefill:
+        result = impl.exec_kv_prefill(
+            kv,
+            cos,
+            sin,
+            kv_cache,
+            slots,
+            attn_metadata=metadata,
+        )
+
+    assert result is expected
+    ordinary_exec_kv_prefill.assert_called_once_with(
+        kv,
+        cos,
+        sin,
+        kv_cache,
+        slots,
+        attn_metadata=metadata,
+    )
 
 
 def test_mla_pcp_prefill_gathers_padded_cache_inputs() -> None:
@@ -451,6 +509,7 @@ class TestAscendMLAMetadataBuilder(TestBase):
             self.kv_cache_spec = kv_cache_spec
             self.model_config = vllm_config.model_config
             self.vllm_config = vllm_config
+            self.use_pcp = False
             self.device = device
             self.chunked_prefill_workspace_size = 128 * 1024
             self.chunked_prefill_workspace = torch.empty(
@@ -752,6 +811,7 @@ class TestAscendMLAMetadataBuilderBuild(TestBase):
             self.kv_cache_spec = kv_cache_spec
             self.model_config = vllm_config.model_config
             self.vllm_config = vllm_config
+            self.use_pcp = False
             self.device = device
             self.chunked_prefill_workspace_size = 128 * 1024
             self.chunked_prefill_workspace = torch.empty(
