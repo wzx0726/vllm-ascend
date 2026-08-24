@@ -1559,9 +1559,11 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         cos = attn_metadata.cos
         sin = attn_metadata.sin
+        slot_mapping_li = attn_metadata.slot_mapping
+        slot_mapping_sfa = self._get_sfa_kv_slot_mapping(attn_metadata)
+
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = attn_metadata.num_input_tokens
-        slot_mapping = attn_metadata.slot_mapping
         parallel_context = self._get_parallel_forward_context(
             attn_metadata,
             num_input_tokens,
@@ -1580,10 +1582,9 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if fused_type != PreprocessType.NATIVE:
             if fused_type == PreprocessType.PROLOG_V3:
-                assert slot_mapping.numel() == hidden_states.shape[0], (
+                assert slot_mapping_sfa.numel() == hidden_states.shape[0], (
                     "SFA Prolog V3 requires one cache index per input token, "
-                    f"got token_x={hidden_states.shape[0]} and "
-                    f"cache_index={slot_mapping.numel()}."
+                    f"got token_x={hidden_states.shape[0]} and cache_index={slot_mapping_sfa.numel()}."
                 )
             if self.has_indexer:
                 k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
@@ -1597,7 +1598,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     kv_cache=kv_cache,
                     cos=cos,
                     sin=sin,
-                    slot_mapping=slot_mapping,
+                    slot_mapping=slot_mapping_sfa,
                 )
             else:
                 hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_mlapo(
@@ -1605,7 +1606,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     kv_cache=kv_cache,
                     cos=cos,
                     sin=sin,
-                    slot_mapping=slot_mapping,
+                    slot_mapping=slot_mapping_sfa,
                     num_input_tokens=num_input_tokens,
                 )
         # native
@@ -1681,7 +1682,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert attn_metadata.pcp_slot_mapping is not None
                 indexer_cache_slot_mapping = attn_metadata.pcp_slot_mapping
             else:
-                indexer_cache_slot_mapping = slot_mapping
+                indexer_cache_slot_mapping = slot_mapping_li
             self._write_indexer_cache(
                 k_li,
                 k_li_scale,
