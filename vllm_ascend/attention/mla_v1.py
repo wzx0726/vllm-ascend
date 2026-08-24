@@ -488,10 +488,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         ) = split_decodes_and_prefills(
             common_attn_metadata,
             decode_threshold=self.decode_threshold,
-            treat_short_extends_as_decodes=not (
-                parallel_config.prefill_context_parallel_size > 1
-                or parallel_config.decode_context_parallel_size > 1
-            ),
+            treat_short_extends_as_decodes=not (self.use_pcp or parallel_config.decode_context_parallel_size > 1),
         )
         self.set_num_actual_tokens(common_attn_metadata)
         assert self.num_decodes + self.num_prefills == num_reqs
@@ -818,18 +815,25 @@ class AscendMLAPCPMetadataBuilder(AscendMLAMetadataBuilder):
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.pcp_rank = get_pcp_group().rank_in_group
 
+    def set_pcp_enabled(self, enabled: bool) -> None:
+        """Select PCP or ordinary metadata for this builder instance."""
+        self.use_pcp = enabled
+        self.metadata_cls = AscendMLAPCPMetadata if enabled else AscendMLAMetadata
+
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> AscendMLAPCPMetadata:
+    ) -> AscendMLAMetadata:
         expanded_slot_mapping = common_attn_metadata.slot_mapping
         metadata = super().build(
             common_prefix_len,
             common_attn_metadata,
             fast_build,
         )
+        if not self.use_pcp:
+            return metadata
         assert isinstance(metadata, AscendMLAPCPMetadata)
         if expanded_slot_mapping.numel() % self.pcp_size != 0:
             raise RuntimeError(
@@ -2215,11 +2219,8 @@ class AscendMLAPCPImpl(AscendMLAImpl):
         attn_metadata: AscendMLAMetadata,
     ) -> int:
         if not isinstance(attn_metadata, AscendMLAPCPMetadata):
-            raise RuntimeError("PCP MLA prefill requires AscendMLAPCPMetadata.")
-        return (
-            attn_metadata.pcp_local_num_input_tokens
-            - attn_metadata.num_decode_tokens
-        )
+            return super()._get_num_prefill_kv_tokens(attn_metadata)
+        return attn_metadata.pcp_local_num_input_tokens - attn_metadata.num_decode_tokens
 
     def exec_kv_prefill(
         self,
@@ -2232,7 +2233,14 @@ class AscendMLAPCPImpl(AscendMLAImpl):
         attn_metadata: AscendMLAMetadata | None = None,
     ):
         if not isinstance(attn_metadata, AscendMLAPCPMetadata):
-            raise RuntimeError("PCP MLA prefill requires AscendMLAPCPMetadata.")
+            return super().exec_kv_prefill(
+                kv_no_split,
+                cos,
+                sin,
+                kv_cache,
+                slots,
+                attn_metadata=attn_metadata,
+            )
 
         num_decode_tokens = attn_metadata.num_decode_tokens
         local_num_input_tokens = attn_metadata.pcp_local_num_input_tokens

@@ -443,11 +443,19 @@ class AscendAttentionPCPMetadataBuilder(AscendAttentionMetadataBuilder):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
+        self.use_pcp = True
+
+    def set_pcp_enabled(self, enabled: bool) -> None:
+        """Select PCP or ordinary metadata for this builder instance."""
+        self.use_pcp = enabled
+        self.metadata_cls = AscendAttentionPCPMetadata if enabled else AscendMetadata
 
     def _split_decodes_and_prefills(
         self,
         common_attn_metadata: AscendCommonAttentionMetadata,
     ) -> tuple[int, int, int, int]:
+        if not self.use_pcp:
+            return super()._split_decodes_and_prefills(common_attn_metadata)
         return split_decodes_and_prefills(
             common_attn_metadata,
             decode_threshold=self.decode_threshold,
@@ -459,13 +467,15 @@ class AscendAttentionPCPMetadataBuilder(AscendAttentionMetadataBuilder):
         common_prefix_len: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> AscendAttentionPCPMetadata:
+    ) -> AscendMetadata:
         expanded_slot_mapping = common_attn_metadata.slot_mapping
         metadata = super().build(
             common_prefix_len,
             common_attn_metadata,
             fast_build,
         )
+        if not self.use_pcp:
+            return metadata
         assert isinstance(metadata, AscendAttentionPCPMetadata)
         if expanded_slot_mapping.numel() % self.pcp_size != 0:
             raise RuntimeError(
@@ -1756,6 +1766,15 @@ class AscendAttentionPCPImpl(AscendAttentionBackendImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
     ):
+        if not isinstance(attn_metadata, AscendAttentionPCPMetadata):
+            return super().reshape_and_cache(
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+            )
         if len(kv_cache) <= 1:
             return query, key, value, output
         expanded_slot_mapping = attn_metadata.slot_mapping

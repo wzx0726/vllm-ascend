@@ -68,15 +68,12 @@ class TestAscendAttentionBackend(TestBase):
         self.utils_patcher = patch("vllm_ascend.attention.utils.get_current_vllm_config", return_value=self.mock_config)
         self.utils_patcher.start()
 
-        from vllm_ascend.attention.utils import enable_dcp, enable_pcp
+        from vllm_ascend.attention.utils import enable_dcp
 
         self.enable_dcp = enable_dcp
-        self.enable_pcp = enable_pcp
         enable_dcp.cache_clear()
-        enable_pcp.cache_clear()
         self.addCleanup(self.utils_patcher.stop)
         self.addCleanup(enable_dcp.cache_clear)
-        self.addCleanup(enable_pcp.cache_clear)
 
     def test_get_name(self):
         self.assertEqual(AscendAttentionBackend.get_name(), "CUSTOM")
@@ -89,7 +86,6 @@ class TestAscendAttentionBackend(TestBase):
 
     def test_get_impl_cls_with_pcp(self):
         self.mock_config.parallel_config.prefill_context_parallel_size = 2
-        self.enable_pcp.cache_clear()
 
         self.assertIs(
             AscendAttentionBackend.get_impl_cls(),
@@ -98,17 +94,33 @@ class TestAscendAttentionBackend(TestBase):
 
     def test_get_builder_cls_with_pcp(self):
         self.mock_config.parallel_config.prefill_context_parallel_size = 2
-        self.enable_pcp.cache_clear()
 
         self.assertIs(
             AscendAttentionBackend.get_builder_cls(),
             AscendAttentionPCPMetadataBuilder,
         )
 
+    def test_impl_tracks_current_pcp_config(self):
+        self.assertIs(
+            AscendAttentionBackend.get_impl_cls(),
+            AscendAttentionBackendImpl,
+        )
+
+        self.mock_config.parallel_config.prefill_context_parallel_size = 2
+        self.assertIs(
+            AscendAttentionBackend.get_impl_cls(),
+            AscendAttentionPCPImpl,
+        )
+
+        self.mock_config.parallel_config.prefill_context_parallel_size = 1
+        self.assertIs(
+            AscendAttentionBackend.get_impl_cls(),
+            AscendAttentionBackendImpl,
+        )
+
     def test_pcp_and_dcp_are_rejected_together(self):
         self.mock_config.parallel_config.prefill_context_parallel_size = 2
         self.mock_config.parallel_config.decode_context_parallel_size = 2
-        self.enable_pcp.cache_clear()
         self.enable_dcp.cache_clear()
 
         with self.assertRaisesRegex(NotImplementedError, "PCP and DCP"):
@@ -211,6 +223,7 @@ class TestAscendAttentionMetadataBuilder(TestBase):
 def test_pcp_metadata_keeps_expanded_slot_mapping() -> None:
     builder = AscendAttentionPCPMetadataBuilder.__new__(AscendAttentionPCPMetadataBuilder)
     builder.pcp_size = 2
+    builder.set_pcp_enabled(True)
     common_metadata = SimpleNamespace(
         slot_mapping=torch.tensor(
             [10, 11, -1, -1, 20, 21, -1, -1],
@@ -234,6 +247,69 @@ def test_pcp_metadata_keeps_expanded_slot_mapping() -> None:
     assert result.slot_mapping is common_metadata.slot_mapping
     assert result.pcp_local_num_input_tokens == 4
     assert result.attn_state == AscendAttentionState.ChunkedPrefill
+
+
+def test_pcp_builder_can_emit_ordinary_metadata() -> None:
+    builder = AscendAttentionPCPMetadataBuilder.__new__(AscendAttentionPCPMetadataBuilder)
+    builder.decode_threshold = 1
+    builder.set_pcp_enabled(False)
+    common_metadata = SimpleNamespace(slot_mapping=torch.tensor([1, 2]))
+    metadata = MagicMock(spec=attn_module.AscendMetadata)
+
+    with patch.object(
+        AscendAttentionMetadataBuilder,
+        "build",
+        return_value=metadata,
+    ):
+        result = builder.build(0, common_metadata)
+
+    assert result is metadata
+    assert builder.metadata_cls is attn_module.AscendMetadata
+
+    expected_split = (1, 1, 1, 2)
+    with patch.object(
+        AscendAttentionMetadataBuilder,
+        "_split_decodes_and_prefills",
+        return_value=expected_split,
+    ) as ordinary_split:
+        assert builder._split_decodes_and_prefills(common_metadata) == expected_split
+
+    ordinary_split.assert_called_once_with(common_metadata)
+
+
+def test_pcp_impl_delegates_for_ordinary_metadata() -> None:
+    impl = AscendAttentionPCPImpl.__new__(AscendAttentionPCPImpl)
+    query = torch.empty((1, 1, 1))
+    key = torch.empty((1, 1, 1))
+    value = torch.empty((1, 1, 1))
+    output = torch.empty((1, 1, 1))
+    kv_cache = (torch.empty(1), torch.empty(1))
+    metadata = MagicMock(spec=attn_module.AscendMetadata)
+    expected = (query, key, value, output)
+
+    with patch.object(
+        AscendAttentionBackendImpl,
+        "reshape_and_cache",
+        return_value=expected,
+    ) as ordinary_reshape_and_cache:
+        result = impl.reshape_and_cache(
+            query,
+            key,
+            value,
+            kv_cache,
+            metadata,
+            output,
+        )
+
+    assert result is expected
+    ordinary_reshape_and_cache.assert_called_once_with(
+        query,
+        key,
+        value,
+        kv_cache,
+        metadata,
+        output,
+    )
 
 
 def test_pcp_cache_write_uses_gathered_inputs() -> None:
@@ -302,6 +378,7 @@ def test_pcp_cache_write_uses_gathered_inputs() -> None:
 def test_pcp_builder_keeps_short_extend_in_prefill() -> None:
     builder = AscendAttentionPCPMetadataBuilder.__new__(AscendAttentionPCPMetadataBuilder)
     builder.decode_threshold = 1
+    builder.set_pcp_enabled(True)
     common_metadata = SimpleNamespace(
         context_parallel_metadata=None,
         max_query_len=4,

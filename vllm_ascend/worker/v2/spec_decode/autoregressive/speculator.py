@@ -22,28 +22,47 @@ from copy import copy
 from typing import Any, cast
 
 import torch
-from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config import (
+    VllmConfig,
+    get_layers_from_vllm_config,
+    set_current_vllm_config,
+)
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import AutoRegressiveSpeculator
+from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
+    AutoRegressiveSpeculator,
+)
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
+from vllm_ascend.attention.attention_v1 import (
+    AscendAttentionBackend,
+    AscendAttentionPCPMetadataBuilder,
+    AscendAttentionState,
+)
 from vllm_ascend.attention.dsa_v1 import AscendDSABackend
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
-from vllm_ascend.attention.mla_v1 import AscendMLABackend
+from vllm_ascend.attention.mla_v1 import (
+    AscendMLABackend,
+    AscendMLAPCPMetadataBuilder,
+)
 from vllm_ascend.attention.sfa_v1 import AscendSFABackend
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_metadata_wrapper,
     build_draft_attn_metadata_factory,
 )
-from vllm_ascend.worker.v2.input_batch import AscendInputBuffers
+from vllm_ascend.worker.v2.input_batch import (
+    AscendInputBatch,
+    AscendInputBuffers,
+)
+from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +102,7 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
 
         # add more attributes for `input_buffers` in graph mode
         cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
-        if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
+        if not self.speculative_config.enforce_eager and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
             self.input_buffers.draft_seq_lens_cpus = [
                 torch.zeros(self.max_num_reqs, dtype=torch.int32, device="cpu")
                 for _ in range(self.num_speculative_steps - 1)
@@ -92,8 +111,20 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         # when in decode phase of eagle speculator, we need some value in
         # draft model's input_batch. so we keep a reference here.
         self.input_batch: InputBatch | None = None
+        self.pcp_manager: AscendPCPManager | None = None
+
+    @property
+    def draft_prefill_attn_groups(self) -> list[list[AttentionGroup]]:
+        if self.pcp_manager is not None:
+            return self.attn_groups
+        return self.target_attn_groups
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        if (
+            self.speculative_config.enforce_eager
+            or self.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+        ):
+            cudagraph_mode = CUDAGraphMode.NONE
         super().init_cudagraph_manager(cudagraph_mode)
         # The Ascend graph managers are patched onto the upstream module and
         # created by super().init_cudagraph_manager without a speculator ref.
@@ -102,6 +133,40 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         self.decode_cudagraph_manager.speculator = self
         self.prefill_cudagraph_manager.update_stream = self.update_stream
         self.decode_cudagraph_manager.update_stream = self.update_stream
+
+    def _prepare_replicated_pcp_attn(
+        self,
+        input_batch: AscendInputBatch,
+    ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+        cudagraph_mode = (
+            CUDAGraphMode.FULL
+            if input_batch.num_reqs_after_padding > input_batch.num_reqs
+            or input_batch.num_tokens_after_padding > input_batch.num_tokens
+            else CUDAGraphMode.NONE
+        )
+        block_tables = self.block_tables.gather_block_tables(
+            input_batch.idx_mapping,
+            num_reqs_padded=input_batch.num_reqs_after_padding,
+        )
+        global_slot_mappings = self.block_tables.compute_slot_mappings(
+            input_batch.idx_mapping,
+            input_batch.query_start_loc,
+            input_batch.positions,
+            num_tokens_padded=input_batch.num_tokens_after_padding,
+        )
+        attn_metadata = self.model_state.prepare_attn(
+            input_batch,
+            cudagraph_mode,
+            block_tables,
+            global_slot_mappings,
+            self.draft_prefill_attn_groups,
+            self.kv_cache_config,
+        )
+        slot_mappings = build_slot_mappings_by_layer(
+            global_slot_mappings,
+            self.kv_cache_config,
+        )
+        return attn_metadata, slot_mappings
 
     def propose(
         self,
@@ -139,6 +204,21 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         # wrap build_attn_metadata to use Ascend attention metadata building.
         # so we can call super().propose() directly.
         with build_attn_metadata_wrapper(), torch_gather_wrapper():
+            if self.method in ("mtp", "eagle3") and self.pcp_manager is not None and not dummy_run:
+                assert isinstance(input_batch, AscendInputBatch)
+                attn_metadata, slot_mappings = self._prepare_replicated_pcp_attn(
+                    input_batch,
+                )
+
+                if self.method == "eagle3":
+                    if not aux_hidden_states:
+                        raise RuntimeError("Eagle3 with PCP requires auxiliary target hidden states.")
+                    combined_aux_hidden_states = torch.cat(
+                        aux_hidden_states,
+                        dim=-1,
+                    )
+                    aux_hidden_states = [self.pcp_manager.restore_hidden_states(combined_aux_hidden_states)]
+
             return super().propose(
                 input_batch,
                 attn_metadata,
@@ -166,13 +246,28 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         target_input_buffers: InputBuffers,
         target_attn_groups: list[list[AttentionGroup]],
     ) -> None:
-        super().set_attn(
-            model_state,
-            kv_cache_config,
-            block_tables,
-            target_input_buffers,
-            target_attn_groups,
-        )
+        # Ascend backend factories read the current config when choosing the
+        # metadata builder class, in addition to the explicit config argument.
+        with set_current_vllm_config(self.attn_vllm_config):
+            super().set_attn(
+                model_state,
+                kv_cache_config,
+                block_tables,
+                target_input_buffers,
+                target_attn_groups,
+            )
+
+        for attn_group_list in self.attn_groups:
+            for attn_group in attn_group_list:
+                for builder in attn_group.metadata_builders:
+                    if isinstance(
+                        builder,
+                        (
+                            AscendAttentionPCPMetadataBuilder,
+                            AscendMLAPCPMetadataBuilder,
+                        ),
+                    ):
+                        builder.set_pcp_enabled(False)
 
         # npu needs attn_backends to update graph params
         attn_backends: dict[str, type[AttentionBackend]] = {}
@@ -187,7 +282,10 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
             attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type, layer_names)
 
             for layer_name in layer_names:
-                attn_backend = attn_layers[layer_name].get_attn_backend()
+                attn_layer = attn_layers[layer_name]
+                if isinstance(attn_layer, MLAAttention):
+                    attn_layer.use_pcp = False
+                attn_backend = attn_layer.get_attn_backend()
                 attn_backends[layer_name] = attn_backend
 
         self.attn_backends = attn_backends
@@ -222,7 +320,7 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
             self.model_state,
             self.target_input_buffers,
             self.block_tables,
-            self.target_attn_groups,
+            self.draft_prefill_attn_groups,
             self.kv_cache_config,
             progress_bar_desc="Capturing prefill CUDA graphs",
         )
@@ -415,7 +513,10 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         return draft_attn_metadatas
 
     def _update_decode_attn_metadata(
-        self, attn_metadata: dict[str, Any] | None, step: int, num_reqs: int | None = None
+        self,
+        attn_metadata: dict[str, Any] | None,
+        step: int,
+        num_reqs: int | None = None,
     ):
         """Update per-step decode attention metadata on Ascend."""
         if attn_metadata is None:
