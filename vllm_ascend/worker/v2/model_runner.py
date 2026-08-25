@@ -153,10 +153,8 @@ class NPUModelRunner(GPUModelRunner):
             device=self.device,
         )
 
-        # we need to copy num_computed_tokens back to cpu to help
-        # update actual seq_lens_cpu. gpu attention backend doesn't need these
-        # attributes, cause their attention backends doesn't use seq_lens_cpu.
-        # and seq_lens_cpu is deprecated in gpu_model_runner_v2.
+        # Pinned D2H staging for corrected device state after spec rejection.
+        # The authoritative host state is the shared NumPy/torch RequestState view.
         self.num_computed_tokens_event = torch.npu.Event()
         self.num_computed_tokens_stream = torch.npu.Stream()
         self.num_computed_tokens_cpu = torch.empty(
@@ -196,6 +194,8 @@ class NPUModelRunner(GPUModelRunner):
                 assert isinstance(self.pcp_manager, AscendPCPManager)
                 self.pcp_manager.vllm_config = self.vllm_config
                 self.model_state.pcp_manager = self.pcp_manager
+                if self.speculator is not None:
+                    self.speculator.pcp_manager = self.pcp_manager
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
 
@@ -233,6 +233,14 @@ class NPUModelRunner(GPUModelRunner):
                 is_profile=is_profile,
                 context_len=context_len,
             )
+
+        state = self.execute_model_state
+        if self.is_last_pp_rank and state is not None and self.pcp_manager is not None and self.speculator is not None:
+            get_hidden_states = getattr(self.model, "get_mtp_target_hidden_states", None)
+            if get_hidden_states is not None:
+                mtp_target_hidden_states = get_hidden_states()
+                if mtp_target_hidden_states is not None:
+                    self.pcp_manager.restore_hidden_state_buffer(mtp_target_hidden_states)
 
         self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
             profiling_config,
@@ -727,8 +735,7 @@ class NPUModelRunner(GPUModelRunner):
             query_start_loc,
         )
 
-        # Skip D2H copy without MTP: num_computed_tokens_cpu is synced
-        # from num_computed_tokens_np in _update_seq_lens_cpu instead.
+        # Without MTP, update_requests writes the shared NumPy/torch CPU state.
         if self.speculator is not None:
             self._copy_num_computed_tokens_to_cpu()
 
@@ -754,16 +761,13 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
 
         # MTP needs D2H copy to get reverted num_computed_tokens after rejection.
-        # Without MTP, num_computed_tokens_np is already correct from update_requests.
+        # req_states.num_computed_tokens_cpu shares storage with its NumPy view,
+        # so this update also corrects the num_computed_tokens_np used by PCP.
         if self.speculator is not None:
             self.num_computed_tokens_event.synchronize()
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
                 req_index = self.req_states.req_id_to_index[req_id]
                 self.req_states.num_computed_tokens_cpu[req_index] = self.num_computed_tokens_cpu[req_index]
-        else:
-            for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
-                req_index = self.req_states.req_id_to_index[req_id]
-                self.req_states.num_computed_tokens_cpu[req_index] = self.req_states.num_computed_tokens_np[req_index]
 
         # update seq_lens_cpu
         for i, req_id in enumerate(req_ids):  # type: ignore
