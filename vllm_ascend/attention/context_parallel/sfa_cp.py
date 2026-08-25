@@ -8,7 +8,7 @@ import torch_npu
 from torch import nn
 from vllm.config import VllmConfig
 from vllm.distributed import get_tp_group
-from vllm.model_executor.layers.attention.pcp import _gather_prefill_cache_inputs
+from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import AttentionSpec
 

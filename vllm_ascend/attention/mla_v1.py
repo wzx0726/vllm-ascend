@@ -11,7 +11,7 @@ from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadataBuilder,
 )
-from vllm.model_executor.layers.attention.pcp import _gather_prefill_cache_inputs
+from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.attention.backend import (
