@@ -109,6 +109,23 @@ class AscendPCPManager(PCPManager):
         local_batch.seq_lens_np = local_batch.num_computed_tokens_np + local_batch.num_scheduled_tokens
         return local_batch
 
+    def prepare_attn(
+        self,
+        input_batch: AscendInputBatch,
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        """Use capture-safe dummy metadata without changing runtime prep."""
+        if not input_batch.is_dummy:
+            return super().prepare_attn(input_batch)
+
+        assert self._local_block_tables is not None
+        num_reqs = input_batch.num_reqs_after_padding
+        for block_table in self._local_block_tables:
+            block_table[:num_reqs].zero_()
+        return (
+            tuple(block_table[:num_reqs] for block_table in self._local_block_tables),
+            self.get_dummy_slot_mappings(input_batch.num_tokens_after_padding),
+        )
+
     def prepare_slot_mappings(self) -> torch.Tensor:
         """Pad PCP slot mappings to the fixed FULL-decode graph layout."""
         slot_mappings = super().prepare_slot_mappings()
