@@ -21,7 +21,9 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
@@ -215,6 +217,46 @@ def test_dummy_attention_context_uses_rank_local_identity_view():
         ),
     )
     assert actual.local_num_tokens_after_padding == input_batch.num_tokens
+
+
+def test_prepare_attn_uses_persistent_pad_filled_dummy_buffers() -> None:
+    manager = AscendPCPManager.__new__(AscendPCPManager)
+    manager.pcp_world_size = 2
+    manager._local_block_tables = (torch.full((4, 3), 7, dtype=torch.int32),)
+    manager._gathered_kv_slot_mappings = torch.zeros(
+        (1, 16),
+        dtype=torch.int64,
+    )
+    input_batch = SimpleNamespace(
+        is_dummy=True,
+        num_reqs_after_padding=2,
+        num_tokens_after_padding=4,
+    )
+
+    block_tables, slot_mappings = manager.prepare_attn(input_batch)
+
+    persistent_block_table = manager._local_block_tables[0]
+    assert block_tables[0].data_ptr() == persistent_block_table.data_ptr()
+    assert torch.equal(block_tables[0], torch.zeros(2, 3, dtype=torch.int32))
+    assert torch.equal(
+        persistent_block_table[2:],
+        torch.full((2, 3), 7, dtype=torch.int32),
+    )
+    assert slot_mappings.data_ptr() == manager._gathered_kv_slot_mappings.data_ptr()
+    assert slot_mappings.shape == (1, 8)
+    assert torch.all(slot_mappings == PAD_SLOT_ID)
+
+
+def test_prepare_attn_delegates_runtime_batches() -> None:
+    manager = AscendPCPManager.__new__(AscendPCPManager)
+    input_batch = SimpleNamespace(is_dummy=False)
+    expected = ((torch.empty(0),), torch.empty(0))
+
+    with patch.object(PCPManager, "prepare_attn", return_value=expected) as prepare_attn:
+        actual = manager.prepare_attn(input_batch)
+
+    assert actual is expected
+    prepare_attn.assert_called_once_with(input_batch)
 
 
 def test_mrv2_runner_registers_ascend_pcp_manager() -> None:
