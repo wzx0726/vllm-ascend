@@ -114,6 +114,11 @@ def _ascend_FusedMoE(
     tid2eid: torch.Tensor | None = None,
     **kwargs,
 ):
+    vllm_config = get_current_vllm_config()
+    kwargs.setdefault(
+        "pcp_size",
+        vllm_config.parallel_config.prefill_context_parallel_size,
+    )
     # RoutedExperts allocates its parameters before AscendMoERunner is
     # constructed. Propagate Ascend EPLB capacity into the upstream factory so
     # redundant expert slots are present when weights are created and loaded.
@@ -131,7 +136,7 @@ def _ascend_FusedMoE(
     # the legacy Ascend quant-method path until that path also routes solely
     # through the Router.
     hash_indices_table_for_legacy_path = hash_indices_table if hash_indices_table is not None else tid2eid
-    enable_router_eplb = enable_eplb and get_current_vllm_config().use_v2_model_runner
+    enable_router_eplb = enable_eplb and vllm_config.use_v2_model_runner
     if router is None:
         router = create_ascend_fused_moe_router(
             top_k=top_k,
