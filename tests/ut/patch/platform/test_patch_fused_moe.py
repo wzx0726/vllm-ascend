@@ -40,7 +40,10 @@ def test_factory_adapts_only_the_returned_router():
         patch.object(
             patch_fused_moe,
             "get_current_vllm_config",
-            return_value=SimpleNamespace(use_v2_model_runner=True),
+            return_value=SimpleNamespace(
+                use_v2_model_runner=True,
+                parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+            ),
         ),
     ):
         result = patch_fused_moe._ascend_FusedMoE(
@@ -51,6 +54,7 @@ def test_factory_adapts_only_the_returned_router():
         )
 
     assert result is runner
+    assert original_factory.call_args.kwargs["pcp_size"] == 1
     assert isinstance(router.eplb_state, AscendEplbLayerState)
     assert getattr(router._apply_eplb_mapping, "__func__", None) is patch_fused_moe._ascend_apply_eplb_mapping
     assert getattr(untouched_router._apply_eplb_mapping, "__func__", None) is _Router._apply_eplb_mapping
@@ -76,7 +80,10 @@ def test_factory_keeps_v1_eplb_on_the_legacy_routing_path():
         patch.object(
             patch_fused_moe,
             "get_current_vllm_config",
-            return_value=SimpleNamespace(use_v2_model_runner=False),
+            return_value=SimpleNamespace(
+                use_v2_model_runner=False,
+                parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+            ),
         ),
     ):
         result = patch_fused_moe._ascend_FusedMoE(
@@ -127,6 +134,14 @@ def test_factory_shares_upstream_hash_table_with_legacy_ascend_routing():
     with (
         patch.object(patch_fused_moe, "_original_FusedMoE", original_factory),
         patch.object(patch_fused_moe, "get_ascend_config", return_value=ascend_config),
+        patch.object(
+            patch_fused_moe,
+            "get_current_vllm_config",
+            return_value=SimpleNamespace(
+                use_v2_model_runner=True,
+                parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+            ),
+        ),
     ):
         patch_fused_moe._ascend_FusedMoE(
             num_experts=8,

@@ -20,18 +20,15 @@ import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import copy
-from typing import Any, cast
+from typing import Any
 
 import torch
 from vllm.config import (
     VllmConfig,
-    get_layers_from_vllm_config,
     replace,
     set_current_vllm_config,
 )
 from vllm.config.compilation import CUDAGraphMode
-from vllm.model_executor.layers.attention.mla_attention import MLAAttention
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -278,22 +275,6 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
                         ),
                     ):
                         builder.set_pcp_enabled(False)
-
-        active_layer_names = self.draft_attn_layer_names
-        for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
-            layer_names = kv_cache_group_spec.layer_names
-            if active_layer_names is not None:
-                layer_names = list(active_layer_names.intersection(layer_names))
-
-            attn_layers = get_layers_from_vllm_config(
-                self.vllm_config,
-                cast(type[Any], AttentionLayerBase),
-                layer_names,
-            )
-            for layer_name in layer_names:
-                attn_layer = attn_layers[layer_name]
-                if isinstance(attn_layer, MLAAttention):
-                    attn_layer.use_pcp = False
 
         # Use the first executable draft attention layer as the architecture
         # discriminator and cache it for ACL graph parameter updates.
