@@ -34,7 +34,6 @@ from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -85,7 +84,7 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         seq_lens_cpu from input_batch), so we replace input_buffers with
         AscendInputBuffers after super().__init__.
         """
-        super().__init__(vllm_config, device)
+        super().__init__(self._create_draft_execution_config(vllm_config), device)
 
         self.attn_architecture: str | None = None
         self.attn_backend: type[AttentionBackend] | None = None
@@ -113,16 +112,24 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         self.input_batch: InputBatch | None = None
         self.pcp_manager: AscendPCPManager | None = None
 
+    @staticmethod
+    def _create_draft_execution_config(vllm_config: VllmConfig) -> VllmConfig:
+        """Run each replicated draft with its own parallel topology."""
+        assert vllm_config.speculative_config is not None
+        draft_parallel_config = vllm_config.speculative_config.draft_parallel_config
+        return replace(
+            vllm_config,
+            parallel_config=replace(
+                draft_parallel_config,
+                rank=vllm_config.parallel_config.rank,
+            ),
+        )
+
     def _create_draft_vllm_config(self) -> VllmConfig:
-        """Build the runtime config used while executing the draft model."""
-        draft_parallel_config = self.speculative_config.draft_parallel_config
+        """Build the config published while executing the draft model."""
         return replace(
             self.vllm_config,
             model_config=self.draft_model_config,
-            parallel_config=replace(
-                draft_parallel_config,
-                rank=self.vllm_config.parallel_config.rank,
-            ),
         )
 
     @property
@@ -166,40 +173,6 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         self.prefill_cudagraph_manager.update_stream = self.update_stream
         self.decode_cudagraph_manager.update_stream = self.update_stream
 
-    def _prepare_replicated_pcp_attn(
-        self,
-        input_batch: AscendInputBatch,
-    ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
-        cudagraph_mode = (
-            CUDAGraphMode.FULL
-            if input_batch.num_reqs_after_padding > input_batch.num_reqs
-            or input_batch.num_tokens_after_padding > input_batch.num_tokens
-            else CUDAGraphMode.NONE
-        )
-        block_tables = self.block_tables.gather_block_tables(
-            input_batch.idx_mapping,
-            num_reqs_padded=input_batch.num_reqs_after_padding,
-        )
-        global_slot_mappings = self.block_tables.compute_slot_mappings(
-            input_batch.idx_mapping,
-            input_batch.query_start_loc,
-            input_batch.positions,
-            num_tokens_padded=input_batch.num_tokens_after_padding,
-        )
-        attn_metadata = self.model_state.prepare_attn(
-            input_batch,
-            cudagraph_mode,
-            block_tables,
-            global_slot_mappings,
-            self.draft_prefill_attn_groups,
-            self.kv_cache_config,
-        )
-        slot_mappings = build_slot_mappings_by_layer(
-            global_slot_mappings,
-            self.kv_cache_config,
-        )
-        return attn_metadata, slot_mappings
-
     def propose(
         self,
         input_batch: InputBatch,
@@ -242,7 +215,8 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         ):
             if self.method in ("mtp", "eagle3") and self.pcp_manager is not None and not dummy_run:
                 assert isinstance(input_batch, AscendInputBatch)
-                attn_metadata, slot_mappings = self._prepare_replicated_pcp_attn(
+                attn_metadata, slot_mappings = self.pcp_manager.prepare_replicated_draft_attn(
+                    self,
                     input_batch,
                 )
 
@@ -282,8 +256,8 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         target_input_buffers: InputBuffers,
         target_attn_groups: list[list[AttentionGroup]],
     ) -> None:
-        # Backend factories also consult the current config when choosing the
-        # metadata builder, so construct draft attention under its target view.
+        # Backend factories also consult the current config. The speculator's
+        # config already carries the replicated draft topology (PCP=1).
         with set_current_vllm_config(self.attn_vllm_config):
             super().set_attn(
                 model_state,

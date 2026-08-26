@@ -18,15 +18,21 @@
 #
 
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
+
+
+if TYPE_CHECKING:
+    from vllm_ascend.worker.v2.spec_decode.autoregressive.speculator import AscendAutoRegressiveSpeculator
 
 
 @dataclass(frozen=True)
@@ -69,14 +75,37 @@ class AscendPCPManager(PCPManager):
         if vllm_config.lora_config is not None:
             raise NotImplementedError("MRV2 PCP does not support LoRA yet.")
         speculative_config = vllm_config.speculative_config
-        if (
-            speculative_config is not None
-            and speculative_config.method not in ("mtp", "eagle3")
-        ):
-            raise NotImplementedError(
-                "Ascend MRV2 PCP supports speculative decoding only with "
-                "MTP and Eagle3."
-            )
+        if speculative_config is not None:
+            if speculative_config.method not in ("mtp", "eagle3"):
+                raise NotImplementedError(
+                    "Ascend MRV2 PCP supports speculative decoding only with "
+                    "MTP and Eagle3."
+                )
+            if parallel_config.decode_context_parallel_size != 1:
+                raise NotImplementedError(
+                    "Ascend MRV2 PCP speculative decoding does not support DCP yet."
+                )
+            if speculative_config.enable_adaptive_verification:
+                raise NotImplementedError(
+                    "Ascend MRV2 PCP speculative decoding does not support "
+                    "adaptive verification yet."
+                )
+            if speculative_config.num_speculative_tokens_per_batch_size:
+                raise NotImplementedError(
+                    "Ascend MRV2 PCP speculative decoding does not support "
+                    "dynamic draft lengths yet."
+                )
+            if speculative_config.draft_sample_method != "greedy":
+                raise NotImplementedError(
+                    "Ascend MRV2 PCP speculative decoding currently requires "
+                    "greedy draft sampling."
+                )
+            hf_text_config = model_config.hf_text_config
+            if hasattr(hf_text_config, "index_topk"):
+                raise NotImplementedError(
+                    "Ascend MRV2 PCP speculative decoding does not support "
+                    "sparse MLA yet."
+                )
 
         is_sparse_mla = hasattr(model_config.hf_text_config, "index_topk")
         cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
@@ -232,6 +261,62 @@ class AscendPCPManager(PCPManager):
             num_valid_tokens,
         )
         return local_batch
+
+    def prepare_replicated_draft_attn(
+        self,
+        speculator: "AscendAutoRegressiveSpeculator",
+        input_batch: AscendInputBatch,
+    ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+        """Rebuild draft attention from the authoritative global PCP batch."""
+        cudagraph_mode = (
+            CUDAGraphMode.FULL
+            if input_batch.num_reqs_after_padding > input_batch.num_reqs
+            or input_batch.num_tokens_after_padding > input_batch.num_tokens
+            else CUDAGraphMode.NONE
+        )
+        block_tables = speculator.block_tables.gather_block_tables(
+            input_batch.idx_mapping,
+            num_reqs_padded=input_batch.num_reqs_after_padding,
+        )
+        global_slot_mappings = speculator.block_tables.compute_slot_mappings(
+            input_batch.idx_mapping,
+            input_batch.query_start_loc,
+            input_batch.positions,
+            num_tokens_padded=input_batch.num_tokens_after_padding,
+        )
+        attn_metadata = speculator.model_state.prepare_attn(
+            input_batch,
+            cudagraph_mode,
+            block_tables,
+            global_slot_mappings,
+            speculator.draft_prefill_attn_groups,
+            speculator.kv_cache_config,
+        )
+        slot_mappings = build_slot_mappings_by_layer(
+            global_slot_mappings,
+            speculator.kv_cache_config,
+        )
+        return attn_metadata, slot_mappings
+
+    def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Restore active tokens and zero any fixed-graph padding rows."""
+        restored_hidden_states = super().restore_hidden_states(hidden_states)
+        if self._global_batch is None:
+            return restored_hidden_states
+
+        num_tokens = self._global_batch.num_tokens
+        num_tokens_after_padding = self._global_batch.num_tokens_after_padding
+        if num_tokens == num_tokens_after_padding:
+            return restored_hidden_states
+        if restored_hidden_states.shape[0] != num_tokens_after_padding:
+            raise RuntimeError(
+                "PCP restored hidden-state length does not match the global "
+                "graph layout: "
+                f"{restored_hidden_states.shape[0]} != {num_tokens_after_padding}."
+            )
+
+        restored_hidden_states[num_tokens:num_tokens_after_padding].zero_()
+        return restored_hidden_states
 
     def restore_hidden_state_buffer(self, hidden_states: torch.Tensor) -> None:
         """Restore a model-owned rank-local buffer to the global PCP layout."""
