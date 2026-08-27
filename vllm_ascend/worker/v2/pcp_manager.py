@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.distributed import get_pp_group
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
@@ -51,6 +52,11 @@ class AscendPCPManager(PCPManager):
     """PCP manager that refreshes Ascend-only local-batch metadata."""
 
     vllm_config: VllmConfig
+
+    @property
+    def is_last_pp_rank(self) -> bool:
+        """Whether this PCP manager belongs to the last PP stage."""
+        return get_pp_group().is_last_rank
 
     @staticmethod
     def validate_config(
@@ -300,6 +306,9 @@ class AscendPCPManager(PCPManager):
 
     def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Restore active tokens and zero any fixed-graph padding rows."""
+        if not self.is_last_pp_rank:
+            return hidden_states
+
         restored_hidden_states = super().restore_hidden_states(hidden_states)
         if self._global_batch is None:
             return restored_hidden_states
@@ -320,6 +329,9 @@ class AscendPCPManager(PCPManager):
 
     def restore_hidden_state_buffer(self, hidden_states: torch.Tensor) -> None:
         """Restore a model-owned rank-local buffer to the global PCP layout."""
+        if not self.is_last_pp_rank:
+            return
+
         assert self._padded_gather_idx is not None
         local_num_tokens_padded = self._padded_gather_idx.shape[0] // self.pcp_world_size
         restored_hidden_states = self.restore_hidden_states(hidden_states[:local_num_tokens_padded])

@@ -20,7 +20,7 @@ import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import copy
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import (
@@ -56,7 +56,9 @@ from vllm_ascend.attention.mla_v1 import (
     AscendMLABackend,
     AscendMLAPCPMetadataBuilder,
 )
-from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
+
+if TYPE_CHECKING:
+    from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +109,7 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         # when in decode phase of eagle speculator, we need some value in
         # draft model's input_batch. so we keep a reference here.
         self.input_batch: InputBatch | None = None
-        self.pcp_manager: AscendPCPManager | None = None
+        self.pcp_manager: "AscendPCPManager | None" = None
 
     @staticmethod
     def _create_draft_execution_config(vllm_config: VllmConfig) -> VllmConfig:

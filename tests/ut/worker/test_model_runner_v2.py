@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -97,3 +97,28 @@ def test_full_decode_only_keeps_graph_descriptor_request_count():
 
     assert num_reqs_padded == 4
     np.testing.assert_array_equal(actual[:5], np.array([0, 1, 2, 3, 4], dtype=np.int32))
+
+
+def test_execute_model_restores_available_mtp_target_hidden_states():
+    runner = _make_runner(need_timing=False)
+    runner.execute_model_state = SimpleNamespace()
+    target_hidden_states = object()
+    restore_hidden_state_buffer = Mock()
+    runner.pcp_manager = SimpleNamespace(
+        restore_hidden_state_buffer=restore_hidden_state_buffer,
+    )
+    runner.model = SimpleNamespace(
+        get_mtp_target_hidden_states=lambda: target_hidden_states,
+    )
+    scheduler_output = SimpleNamespace(disable_profiling_timing=True)
+
+    with (
+        patch.object(GPUModelRunner, "execute_model", return_value=None),
+        patch(
+            "vllm_ascend.worker.v2.model_runner.vllm_version_is",
+            return_value=True,
+        ),
+    ):
+        runner.execute_model(scheduler_output)
+
+    restore_hidden_state_buffer.assert_called_once_with(target_hidden_states)
