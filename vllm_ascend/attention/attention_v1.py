@@ -447,10 +447,16 @@ class AscendAttentionPCPMetadataBuilder(AscendAttentionMetadataBuilder):
         super().__init__(*args, **kwargs)
         self.pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
 
+    def set_pcp_enabled(self, enabled: bool) -> None:
+        """Select PCP or ordinary metadata for this builder instance."""
+        self.metadata_cls = AscendAttentionPCPMetadata if enabled else AscendMetadata
+
     def _split_decodes_and_prefills(
         self,
         common_attn_metadata: AscendCommonAttentionMetadata,
     ) -> tuple[int, int, int, int]:
+        if self.metadata_cls is not AscendAttentionPCPMetadata:
+            return super()._split_decodes_and_prefills(common_attn_metadata)
         return split_decodes_and_prefills(
             common_attn_metadata,
             decode_threshold=self.decode_threshold,
@@ -462,14 +468,15 @@ class AscendAttentionPCPMetadataBuilder(AscendAttentionMetadataBuilder):
         common_prefix_len: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> AscendAttentionPCPMetadata:
+    ) -> AscendMetadata:
         expanded_slot_mapping = common_attn_metadata.slot_mapping
         metadata = super().build(
             common_prefix_len,
             common_attn_metadata,
             fast_build,
         )
-        assert isinstance(metadata, AscendAttentionPCPMetadata)
+        if not isinstance(metadata, AscendAttentionPCPMetadata):
+            return metadata
         if expanded_slot_mapping.numel() % self.pcp_size != 0:
             raise RuntimeError(
                 "PCP slot mapping size must be divisible by the PCP world size: "
@@ -1763,6 +1770,15 @@ class AscendAttentionPCPImpl(AscendAttentionBackendImpl):
     ):
         if len(kv_cache) <= 1:
             return query, key, value, output
+        if not isinstance(attn_metadata, AscendAttentionPCPMetadata):
+            return super().reshape_and_cache(
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+            )
         expanded_slot_mapping = attn_metadata.slot_mapping
         local_num_input_tokens = attn_metadata.pcp_local_num_input_tokens
         if key.shape[0] < local_num_input_tokens:

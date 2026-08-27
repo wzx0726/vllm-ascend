@@ -16,6 +16,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -25,9 +26,11 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.v1.worker.gpu import pcp_manager as vllm_pcp_manager
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm_ascend.worker.v2 import pcp_manager as pcp_manager_module
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
 from vllm_ascend.utils import vllm_version_is
+from vllm_ascend.worker.v2 import states as states_module
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.model_runner import (
     NPUModelRunner,
@@ -389,6 +392,256 @@ def test_partition_batch_preserves_fia_dummy_layout() -> None:
     assert local_batch.is_padding.tolist() == [False, True, True, True]
     assert manager._hidden_restore_idx is not None
     assert manager._hidden_restore_idx[1:4].tolist() == [0, 0, 0]
+
+
+def test_partition_batch_restores_speculative_target_inputs() -> None:
+    global_batch = _make_global_pcp_batch()
+    global_batch.req_ids = ["spec-req"]
+    global_batch.num_reqs_after_padding = 1
+    global_batch.num_tokens = 2
+    global_batch.num_tokens_after_padding = 2
+    global_batch.input_ids = torch.tensor([101, 202], dtype=torch.int32)
+    global_batch.positions = torch.tensor([10, 11], dtype=torch.int64)
+    global_batch.is_padding = torch.zeros(2, dtype=torch.bool)
+    global_batch.num_scheduled_tokens = np.array([2], dtype=np.int32)
+    global_batch.num_computed_tokens_np = np.array([10], dtype=np.int32)
+    global_batch.is_prefilling_np = np.array([False])
+    global_batch.num_draft_tokens = 1
+    global_batch.num_draft_tokens_per_req = np.array([1], dtype=np.int32)
+
+    local_batch = replace(
+        global_batch,
+        input_ids=torch.zeros(2, dtype=torch.int32),
+        num_draft_tokens=0,
+        num_draft_tokens_per_req=None,
+        seq_lens_np=np.array([12], dtype=np.int32),
+    )
+    manager = AscendPCPManager.__new__(AscendPCPManager)
+    manager.pcp_rank = 0
+    manager.pcp_world_size = 2
+    manager._padded_gather_idx = torch.tensor([0, 1, 0, 1])
+
+    with patch.object(
+        PCPManager,
+        "partition_batch",
+        return_value=local_batch,
+    ) as parent_partition:
+        result = manager.partition_batch(global_batch)
+
+    parent_input = parent_partition.call_args.args[0]
+    assert parent_input is not global_batch
+    assert parent_input.num_draft_tokens == 0
+    assert parent_input.num_draft_tokens_per_req is None
+    assert manager._global_batch is global_batch
+    assert result.input_ids.tolist() == [101, 202]
+    np.testing.assert_array_equal(
+        result.num_draft_tokens_per_req,
+        np.array([1], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        result.seq_lens_np,
+        np.array([12], dtype=np.int32),
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_reqs_after_padding", "num_tokens_after_padding", "cudagraph_mode"),
+    [
+        (2, 6, CUDAGraphMode.NONE),
+        (4, 8, CUDAGraphMode.FULL),
+    ],
+)
+def test_prepare_replicated_draft_attn_uses_global_inputs(
+    num_reqs_after_padding: int,
+    num_tokens_after_padding: int,
+    cudagraph_mode: CUDAGraphMode,
+) -> None:
+    manager = AscendPCPManager.__new__(AscendPCPManager)
+    speculator = MagicMock()
+    speculator.block_tables = MagicMock()
+    speculator.model_state = MagicMock()
+    speculator.draft_prefill_attn_groups = MagicMock()
+    speculator.kv_cache_config = MagicMock()
+
+    input_batch = MagicMock(spec=AscendInputBatch)
+    input_batch.num_reqs = 2
+    input_batch.num_reqs_after_padding = num_reqs_after_padding
+    input_batch.num_tokens = 6
+    input_batch.num_tokens_after_padding = num_tokens_after_padding
+    input_batch.idx_mapping = torch.tensor([3, 7], dtype=torch.int32)
+    input_batch.query_start_loc = torch.tensor(
+        [0, 3, 6, 8, 8][: num_reqs_after_padding + 1],
+        dtype=torch.int32,
+    )
+    input_batch.positions = torch.arange(
+        num_tokens_after_padding,
+        dtype=torch.int64,
+    )
+
+    block_tables = (MagicMock(),)
+    global_slot_mapping = torch.arange(num_tokens_after_padding).unsqueeze(0)
+    attn_metadata = MagicMock()
+    slot_mappings = MagicMock()
+    speculator.block_tables.gather_block_tables.return_value = block_tables
+    speculator.block_tables.compute_slot_mappings.return_value = global_slot_mapping
+    speculator.model_state.prepare_attn.return_value = attn_metadata
+
+    with patch.object(
+        pcp_manager_module,
+        "build_slot_mappings_by_layer",
+        return_value=slot_mappings,
+    ) as build_slot_mappings:
+        result = manager.prepare_replicated_draft_attn(speculator, input_batch)
+
+    assert result == (attn_metadata, slot_mappings)
+    speculator.block_tables.gather_block_tables.assert_called_once_with(
+        input_batch.idx_mapping,
+        num_reqs_padded=input_batch.num_reqs_after_padding,
+    )
+    speculator.block_tables.compute_slot_mappings.assert_called_once_with(
+        input_batch.idx_mapping,
+        input_batch.query_start_loc,
+        input_batch.positions,
+        num_tokens_padded=input_batch.num_tokens_after_padding,
+    )
+    speculator.model_state.prepare_attn.assert_called_once_with(
+        input_batch,
+        cudagraph_mode,
+        block_tables,
+        global_slot_mapping,
+        speculator.draft_prefill_attn_groups,
+        speculator.kv_cache_config,
+    )
+    build_slot_mappings.assert_called_once_with(
+        global_slot_mapping,
+        speculator.kv_cache_config,
+    )
+
+
+def test_request_state_cpu_and_numpy_tokens_share_storage() -> None:
+    def init_base_state(
+        state,
+        max_num_reqs,
+        max_model_len,
+        max_num_batched_tokens,
+        num_speculative_steps,
+        vocab_size,
+        device,
+    ) -> None:
+        state.max_num_reqs = max_num_reqs
+        state.num_computed_tokens_np = np.zeros(max_num_reqs, dtype=np.int32)
+
+    with patch.object(
+        states_module.RequestState,
+        "__init__",
+        init_base_state,
+    ):
+        state = states_module.AscendRequestState(
+            max_num_reqs=2,
+            max_model_len=16,
+            max_num_batched_tokens=16,
+            num_speculative_steps=1,
+            vocab_size=32,
+            device=torch.device("cpu"),
+        )
+
+    assert state.num_computed_tokens_cpu.data_ptr() == state.num_computed_tokens_np.ctypes.data
+    state.num_computed_tokens_np[0] = 17
+    assert state.num_computed_tokens_cpu[0].item() == 17
+    state.num_computed_tokens_cpu[1] = 23
+    assert state.num_computed_tokens_np[1] == 23
+
+
+def test_pcp_manager_restores_model_owned_hidden_buffer() -> None:
+    hidden_states = torch.tensor([[1.0, 2.0], [3.0, 4.0], [-1.0, -1.0], [-1.0, -1.0]])
+    restored = torch.tensor(
+        [[1.0, 2.0], [5.0, 6.0], [3.0, 4.0], [9.0, 9.0]]
+    )
+    manager = AscendPCPManager.__new__(AscendPCPManager)
+    manager.pcp_world_size = 2
+    manager._padded_gather_idx = torch.empty(6, dtype=torch.int64)
+    manager._global_batch = SimpleNamespace(
+        num_tokens=3,
+        num_tokens_after_padding=4,
+    )
+
+    captured_local_hidden_states = []
+
+    def parent_restore_hidden_states(value):
+        captured_local_hidden_states.append(value.clone())
+        return restored.clone()
+
+    with (
+        patch(
+            "vllm_ascend.worker.v2.pcp_manager.get_pp_group",
+            return_value=SimpleNamespace(is_last_rank=True),
+        ),
+        patch.object(
+            PCPManager,
+            "restore_hidden_states",
+            side_effect=parent_restore_hidden_states,
+        ) as restore_hidden_states_mock,
+    ):
+        manager.restore_hidden_state_buffer(hidden_states)
+
+    restore_hidden_states_mock.assert_called_once()
+    torch.testing.assert_close(
+        captured_local_hidden_states[0],
+        torch.tensor([[1.0, 2.0], [3.0, 4.0], [-1.0, -1.0]]),
+    )
+    torch.testing.assert_close(hidden_states[:3], restored[:3])
+    torch.testing.assert_close(hidden_states[3], torch.zeros(2))
+
+
+def test_pcp_manager_skips_hidden_restore_before_last_pp_rank() -> None:
+    manager = AscendPCPManager.__new__(AscendPCPManager)
+    hidden_states = torch.randn(2, 4)
+
+    with (
+        patch(
+            "vllm_ascend.worker.v2.pcp_manager.get_pp_group",
+            return_value=SimpleNamespace(is_last_rank=False),
+        ),
+        patch.object(PCPManager, "restore_hidden_states") as parent_restore,
+    ):
+        restored_hidden_states = manager.restore_hidden_states(hidden_states)
+        manager.restore_hidden_state_buffer(hidden_states)
+
+    assert restored_hidden_states is hidden_states
+    parent_restore.assert_not_called()
+
+
+@pytest.mark.parametrize("method", ["mtp", "eagle3"])
+def test_validate_config_allows_supported_speculators(method: str) -> None:
+    speculative_config = SimpleNamespace(
+        method=method,
+        enable_adaptive_verification=False,
+        num_speculative_tokens_per_batch_size=None,
+        draft_sample_method="greedy",
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2,
+            decode_context_parallel_size=1,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(),
+        ),
+        speculative_config=speculative_config,
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
+    )
+
+    with patch.object(PCPManager, "validate_config") as parent_validate:
+        AscendPCPManager.validate_config(
+            vllm_config,
+            supports_mm_inputs=False,
+        )
+
+    validated_config = parent_validate.call_args.args[0]
+    assert validated_config is not vllm_config
+    assert validated_config.speculative_config is None
+    assert vllm_config.speculative_config is speculative_config
+
 
 
 def test_mrv2_runner_registers_ascend_pcp_manager() -> None:

@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -76,3 +76,28 @@ def test_execute_model_disables_profiling_timer_and_clears_stale_time():
     assert runner._cpp_execution_time_ms is None
     mock_synchronize.assert_not_called()
     mock_perf_counter.assert_not_called()
+
+
+def test_execute_model_restores_available_mtp_target_hidden_states():
+    runner = _make_runner(need_timing=False)
+    runner.execute_model_state = SimpleNamespace()
+    target_hidden_states = object()
+    restore_hidden_state_buffer = Mock()
+    runner.pcp_manager = SimpleNamespace(
+        restore_hidden_state_buffer=restore_hidden_state_buffer,
+    )
+    runner.model = SimpleNamespace(
+        get_mtp_target_hidden_states=lambda: target_hidden_states,
+    )
+    scheduler_output = SimpleNamespace(disable_profiling_timing=True)
+
+    with (
+        patch.object(GPUModelRunner, "execute_model", return_value=None),
+        patch(
+            "vllm_ascend.worker.v2.model_runner.vllm_version_is",
+            return_value=True,
+        ),
+    ):
+        runner.execute_model(scheduler_output)
+
+    restore_hidden_state_buffer.assert_called_once_with(target_hidden_states)
