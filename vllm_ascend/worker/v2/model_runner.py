@@ -257,12 +257,19 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         state = self.execute_model_state
-        if self.is_last_pp_rank and state is not None and self.pcp_manager is not None and self.speculator is not None:
-            get_hidden_states = getattr(self.model, "get_mtp_target_hidden_states", None)
-            if get_hidden_states is not None:
-                mtp_target_hidden_states = get_hidden_states()
-                if mtp_target_hidden_states is not None:
-                    self.pcp_manager.restore_hidden_state_buffer(mtp_target_hidden_states)
+        if state is not None and self.pcp_manager is not None:
+            get_hidden_states = getattr(
+                self.model,
+                "get_mtp_target_hidden_states",
+                None,
+            )
+            mtp_target_hidden_states = (
+                get_hidden_states() if get_hidden_states is not None else None
+            )
+            if mtp_target_hidden_states is not None:
+                self.pcp_manager.restore_hidden_state_buffer(
+                    mtp_target_hidden_states
+                )
 
         self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
             profiling_config,

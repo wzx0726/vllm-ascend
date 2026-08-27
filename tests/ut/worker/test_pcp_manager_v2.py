@@ -571,11 +571,17 @@ def test_pcp_manager_restores_model_owned_hidden_buffer() -> None:
         captured_local_hidden_states.append(value.clone())
         return restored.clone()
 
-    with patch.object(
-        PCPManager,
-        "restore_hidden_states",
-        side_effect=parent_restore_hidden_states,
-    ) as restore_hidden_states_mock:
+    with (
+        patch(
+            "vllm_ascend.worker.v2.pcp_manager.get_pp_group",
+            return_value=SimpleNamespace(is_last_rank=True),
+        ),
+        patch.object(
+            PCPManager,
+            "restore_hidden_states",
+            side_effect=parent_restore_hidden_states,
+        ) as restore_hidden_states_mock,
+    ):
         manager.restore_hidden_state_buffer(hidden_states)
 
     restore_hidden_states_mock.assert_called_once()
@@ -585,6 +591,24 @@ def test_pcp_manager_restores_model_owned_hidden_buffer() -> None:
     )
     torch.testing.assert_close(hidden_states[:3], restored[:3])
     torch.testing.assert_close(hidden_states[3], torch.zeros(2))
+
+
+def test_pcp_manager_skips_hidden_restore_before_last_pp_rank() -> None:
+    manager = AscendPCPManager.__new__(AscendPCPManager)
+    hidden_states = torch.randn(2, 4)
+
+    with (
+        patch(
+            "vllm_ascend.worker.v2.pcp_manager.get_pp_group",
+            return_value=SimpleNamespace(is_last_rank=False),
+        ),
+        patch.object(PCPManager, "restore_hidden_states") as parent_restore,
+    ):
+        restored_hidden_states = manager.restore_hidden_states(hidden_states)
+        manager.restore_hidden_state_buffer(hidden_states)
+
+    assert restored_hidden_states is hidden_states
+    parent_restore.assert_not_called()
 
 
 @pytest.mark.parametrize("method", ["mtp", "eagle3"])
