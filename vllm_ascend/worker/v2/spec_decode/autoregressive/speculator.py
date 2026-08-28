@@ -49,7 +49,6 @@ from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffe
 
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
-    AscendAttentionPCPMetadataBuilder,
     AscendAttentionState,
 )
 from vllm_ascend.attention.mla_v1 import (
@@ -269,13 +268,7 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         for attn_group_list in self.attn_groups:
             for attn_group in attn_group_list:
                 for builder in attn_group.metadata_builders:
-                    if isinstance(
-                        builder,
-                        (
-                            AscendAttentionPCPMetadataBuilder,
-                            AscendMLAPCPMetadataBuilder,
-                        ),
-                    ):
+                    if isinstance(builder, AscendMLAPCPMetadataBuilder):
                         builder.set_pcp_enabled(False)
 
         # Use the first executable draft attention layer as the architecture

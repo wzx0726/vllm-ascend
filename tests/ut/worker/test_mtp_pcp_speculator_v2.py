@@ -10,10 +10,6 @@ import pytest
 import torch
 from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
-from vllm_ascend.attention.attention_v1 import (
-    AscendAttentionPCPMetadata,
-    AscendMetadata,
-)
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import (
     AscendEagleSpeculator,
@@ -97,52 +93,6 @@ def test_without_target_pcp_manager_restores_after_error() -> None:
         raise RuntimeError("proposal failed")
 
     assert speculator.model_state.pcp_manager is speculator.pcp_manager
-
-
-def test_set_attn_disables_pcp_only_for_draft_gqa_metadata() -> None:
-    speculator = object.__new__(AscendMTPSpeculator)
-    speculator.vllm_config = MagicMock()
-    speculator.draft_attn_layer_names = set()
-
-    draft_builder = speculator_module.AscendAttentionPCPMetadataBuilder.__new__(
-        speculator_module.AscendAttentionPCPMetadataBuilder
-    )
-    draft_builder.set_pcp_enabled(True)
-    target_builder = speculator_module.AscendAttentionPCPMetadataBuilder.__new__(
-        speculator_module.AscendAttentionPCPMetadataBuilder
-    )
-    target_builder.set_pcp_enabled(True)
-    draft_group = SimpleNamespace(
-        metadata_builders=[draft_builder],
-        backend=speculator_module.AscendAttentionBackend,
-    )
-    target_attn_groups = [[SimpleNamespace(metadata_builders=[target_builder])]]
-    kv_cache_config = MagicMock()
-    kv_cache_config.kv_cache_groups = []
-
-    def set_draft_groups(*_args, **_kwargs) -> None:
-        speculator.attn_groups = [[draft_group]]
-
-    with (
-        patch.object(
-            speculator_module.AutoRegressiveSpeculator,
-            "set_attn",
-            side_effect=set_draft_groups,
-        ),
-        patch.object(speculator_module, "set_current_vllm_config", return_value=MagicMock()),
-        patch.object(
-            speculator_module,
-            "_get_graph_update_backend",
-            return_value=speculator_module.AscendAttentionBackend,
-        ),
-    ):
-        speculator.set_attn(
-            MagicMock(), kv_cache_config, MagicMock(), MagicMock(), target_attn_groups
-        )
-
-    assert draft_builder.metadata_cls is AscendMetadata
-    assert target_builder.metadata_cls is AscendAttentionPCPMetadata
-    assert speculator.attn_architecture == "GQA"
 
 
 @pytest.mark.parametrize(
