@@ -51,10 +51,7 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionState,
 )
-from vllm_ascend.attention.mla_v1 import (
-    AscendMLABackend,
-    AscendMLAPCPMetadataBuilder,
-)
+from vllm_ascend.attention.mla_v1 import AscendMLABackend
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
@@ -264,12 +261,6 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
                 target_input_buffers,
                 target_attn_groups,
             )
-
-        for attn_group_list in self.attn_groups:
-            for attn_group in attn_group_list:
-                for builder in attn_group.metadata_builders:
-                    if isinstance(builder, AscendMLAPCPMetadataBuilder):
-                        builder.set_pcp_enabled(False)
 
         # Use the first executable draft attention layer as the architecture
         # discriminator and cache it for ACL graph parameter updates.
