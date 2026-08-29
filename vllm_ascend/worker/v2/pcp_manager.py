@@ -18,7 +18,6 @@
 #
 
 from dataclasses import dataclass, replace
-from typing import Any
 
 import numpy as np
 import torch
@@ -65,8 +64,6 @@ class AscendPCPManager(PCPManager):
         if pcp_size <= 1:
             return
 
-        if not model_config.use_mla:
-            raise NotImplementedError("MRV2 PCP currently supports MLA models only.")
         if parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError("MRV2 PCP does not support PP yet.")
         if model_config.is_encoder_decoder:
