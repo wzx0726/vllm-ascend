@@ -18,7 +18,7 @@
 #
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -26,7 +26,6 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm_ascend.worker.v2 import pcp_manager as pcp_manager_module
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
 from vllm_ascend.worker.v2 import states as states_module
@@ -476,12 +475,20 @@ def test_partition_batch_restores_speculative_target_inputs() -> None:
     manager.pcp_rank = 0
     manager.pcp_world_size = 2
     manager._padded_gather_idx = torch.tensor([0, 1, 0, 1])
+    manager.vllm_config = object()
+    local_attn_state = object()
 
-    with patch.object(
-        PCPManager,
-        "partition_batch",
-        return_value=local_batch,
-    ) as parent_partition:
+    with (
+        patch.object(
+            PCPManager,
+            "partition_batch",
+            return_value=local_batch,
+        ) as parent_partition,
+        patch(
+            "vllm_ascend.worker.v2.pcp_manager.build_attn_state",
+            return_value=local_attn_state,
+        ),
+    ):
         result = manager.partition_batch(global_batch)
 
     parent_input = parent_partition.call_args.args[0]
@@ -490,6 +497,7 @@ def test_partition_batch_restores_speculative_target_inputs() -> None:
     assert parent_input.num_draft_tokens_per_req is None
     assert manager._global_batch is global_batch
     assert result.input_ids.tolist() == [101, 202]
+    assert result.num_draft_tokens == 1
     np.testing.assert_array_equal(
         result.num_draft_tokens_per_req,
         np.array([1], dtype=np.int32),
@@ -498,80 +506,7 @@ def test_partition_batch_restores_speculative_target_inputs() -> None:
         result.seq_lens_np,
         np.array([12], dtype=np.int32),
     )
-
-
-@pytest.mark.parametrize(
-    ("num_reqs_after_padding", "num_tokens_after_padding", "cudagraph_mode"),
-    [
-        (2, 6, CUDAGraphMode.NONE),
-        (4, 8, CUDAGraphMode.FULL),
-    ],
-)
-def test_prepare_replicated_draft_attn_uses_global_inputs(
-    num_reqs_after_padding: int,
-    num_tokens_after_padding: int,
-    cudagraph_mode: CUDAGraphMode,
-) -> None:
-    manager = AscendPCPManager.__new__(AscendPCPManager)
-    speculator = MagicMock()
-    speculator.block_tables = MagicMock()
-    speculator.model_state = MagicMock()
-    speculator.draft_prefill_attn_groups = MagicMock()
-    speculator.kv_cache_config = MagicMock()
-
-    input_batch = MagicMock(spec=AscendInputBatch)
-    input_batch.num_reqs = 2
-    input_batch.num_reqs_after_padding = num_reqs_after_padding
-    input_batch.num_tokens = 6
-    input_batch.num_tokens_after_padding = num_tokens_after_padding
-    input_batch.idx_mapping = torch.tensor([3, 7], dtype=torch.int32)
-    input_batch.query_start_loc = torch.tensor(
-        [0, 3, 6, 8, 8][: num_reqs_after_padding + 1],
-        dtype=torch.int32,
-    )
-    input_batch.positions = torch.arange(
-        num_tokens_after_padding,
-        dtype=torch.int64,
-    )
-
-    block_tables = (MagicMock(),)
-    global_slot_mapping = torch.arange(num_tokens_after_padding).unsqueeze(0)
-    attn_metadata = MagicMock()
-    slot_mappings = MagicMock()
-    speculator.block_tables.gather_block_tables.return_value = block_tables
-    speculator.block_tables.compute_slot_mappings.return_value = global_slot_mapping
-    speculator.model_state.prepare_attn.return_value = attn_metadata
-
-    with patch.object(
-        pcp_manager_module,
-        "build_slot_mappings_by_layer",
-        return_value=slot_mappings,
-    ) as build_slot_mappings:
-        result = manager.prepare_replicated_draft_attn(speculator, input_batch)
-
-    assert result == (attn_metadata, slot_mappings)
-    speculator.block_tables.gather_block_tables.assert_called_once_with(
-        input_batch.idx_mapping,
-        num_reqs_padded=input_batch.num_reqs_after_padding,
-    )
-    speculator.block_tables.compute_slot_mappings.assert_called_once_with(
-        input_batch.idx_mapping,
-        input_batch.query_start_loc,
-        input_batch.positions,
-        num_tokens_padded=input_batch.num_tokens_after_padding,
-    )
-    speculator.model_state.prepare_attn.assert_called_once_with(
-        input_batch,
-        cudagraph_mode,
-        block_tables,
-        global_slot_mapping,
-        speculator.draft_prefill_attn_groups,
-        speculator.kv_cache_config,
-    )
-    build_slot_mappings.assert_called_once_with(
-        global_slot_mapping,
-        speculator.kv_cache_config,
-    )
+    assert result.attn_state is local_attn_state
 
 
 def test_request_state_cpu_and_numpy_tokens_share_storage() -> None:

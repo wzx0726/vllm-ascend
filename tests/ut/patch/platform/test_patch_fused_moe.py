@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from vllm_ascend.distributed.eplb.state import AscendEplbLayerState
@@ -21,7 +22,8 @@ class _Router:
         return None
 
 
-def test_factory_adapts_only_the_returned_router():
+@pytest.mark.parametrize("pcp_size", [1, 2])
+def test_factory_adapts_only_the_returned_router(pcp_size: int) -> None:
     router = _Router()
     untouched_router = _Router()
     runner = SimpleNamespace(router=router)
@@ -42,7 +44,7 @@ def test_factory_adapts_only_the_returned_router():
             "get_current_vllm_config",
             return_value=SimpleNamespace(
                 use_v2_model_runner=True,
-                parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+                parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp_size),
             ),
         ),
     ):
@@ -54,7 +56,7 @@ def test_factory_adapts_only_the_returned_router():
         )
 
     assert result is runner
-    assert original_factory.call_args.kwargs["pcp_size"] == 1
+    assert original_factory.call_args.kwargs["pcp_size"] == pcp_size
     assert isinstance(router.eplb_state, AscendEplbLayerState)
     assert getattr(router._apply_eplb_mapping, "__func__", None) is patch_fused_moe._ascend_apply_eplb_mapping
     assert getattr(untouched_router._apply_eplb_mapping, "__func__", None) is _Router._apply_eplb_mapping

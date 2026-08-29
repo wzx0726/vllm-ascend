@@ -9,7 +9,6 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
     AscendAttentionMetadataBuilder,
-    AscendAttentionPCPMetadata,
     AscendAttentionState,
     AscendC8AttentionBackendImpl,
     AscendMetadata,
@@ -85,6 +84,16 @@ class TestAscendAttentionBackend(TestBase):
 
     def test_get_builder_cls(self):
         self.assertEqual(AscendAttentionBackend.get_builder_cls(), AscendAttentionMetadataBuilder)
+
+    def test_supports_pcp_only_for_main_implementation(self):
+        self.assertTrue(AscendAttentionBackend.supports_pcp())
+
+        class OtherAttentionBackend(AscendAttentionBackend):
+            @staticmethod
+            def get_impl_cls():
+                return AscendC8AttentionBackendImpl
+
+        self.assertFalse(OtherAttentionBackend.supports_pcp())
 
     def test_get_impl_cls_with_pcp(self):
         self.mock_config.parallel_config.prefill_context_parallel_size = 2
@@ -168,7 +177,7 @@ class TestAscendAttentionMetadataBuilder(TestBase):
         )
 
         self.assertTrue(pcp_builder.pcp_enabled)
-        self.assertIs(pcp_builder.metadata_cls, AscendAttentionPCPMetadata)
+        self.assertIs(pcp_builder.metadata_cls, AscendMetadata)
 
     def test_unpadded_preserves_internal_seq_lens_cpu(self):
         internal_seq_lens_cpu = torch.tensor([4, 5, 6], dtype=torch.int32)
@@ -227,7 +236,7 @@ def test_pcp_metadata_keeps_expanded_slot_mapping() -> None:
         [10, 11, -1, -1, 20, 21, -1, -1],
         dtype=torch.int64,
     )
-    metadata = AscendAttentionPCPMetadata(
+    metadata = AscendMetadata(
         num_actual_tokens=3,
         num_decode_tokens=1,
         num_prefills=1,
@@ -257,7 +266,7 @@ def test_pcp_cache_write_uses_gathered_inputs() -> None:
     gathered_value = torch.arange(30, 37).reshape(7, 1, 1)
     gathered_slots = torch.tensor([10, 11, -1, -1, 21, -1, -1])
     slot_mapping = torch.tensor([10, 11, -1, -1, 20, 21, -1, -1])
-    metadata = AscendAttentionPCPMetadata(
+    metadata = AscendMetadata(
         num_actual_tokens=3,
         num_decode_tokens=1,
         pcp_local_num_input_tokens=4,

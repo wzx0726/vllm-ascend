@@ -16,7 +16,6 @@ from vllm_ascend.attention.mla_v1 import (
     AscendMLAImpl,
     AscendMLAMetadata,
     AscendMLAMetadataBuilder,
-    AscendMLAPCPMetadata,
     AscendMLAPrefillMetadata,
     ChunkedContextMetadata,
     DecodeMLAPreprocessResult,
@@ -99,8 +98,8 @@ def _make_pcp_metadata(
     num_actual_tokens: int,
     num_decode_tokens: int,
     attn_state: AscendAttentionState = AscendAttentionState.ChunkedPrefill,
-) -> AscendMLAPCPMetadata:
-    return AscendMLAPCPMetadata(
+) -> AscendMLAMetadata:
+    return AscendMLAMetadata(
         num_actual_tokens=num_actual_tokens,
         slot_mapping=torch.empty(0, dtype=torch.int64),
         query_start_loc=torch.tensor([0, num_actual_tokens], dtype=torch.int32),
@@ -803,7 +802,7 @@ class TestAscendMLAMetadataBuilderBuild(TestBase):
             self.mock_device,
         )
         self.assertTrue(pcp_builder.pcp_enabled)
-        self.assertIs(pcp_builder.metadata_cls, AscendMLAPCPMetadata)
+        self.assertIs(pcp_builder.metadata_cls, AscendMLAMetadata)
         self.assertEqual(pcp_builder.pcp_rank, 1)
 
     @patch("vllm_ascend.attention.mla_v1.get_cos_and_sin_mla")
