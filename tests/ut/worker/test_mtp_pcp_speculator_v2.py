@@ -95,6 +95,49 @@ def test_without_target_pcp_manager_restores_after_error() -> None:
     assert speculator.model_state.pcp_manager is speculator.pcp_manager
 
 
+def test_prefill_rebuilds_replicated_pcp_metadata_before_filtering() -> None:
+    speculator = object.__new__(AscendMTPSpeculator)
+    speculator.replicated_pcp = True
+    speculator.input_batch = _make_padded_input_batch()
+    speculator.input_batch.is_dummy = False
+    speculator.draft_attn_layer_names = {"draft.layer"}
+
+    draft_metadata = object()
+    global_slot_mappings = MagicMock()
+    speculator._prepare_replicated_prefill_attn = MagicMock(
+        return_value=(
+            {
+                "draft.layer": draft_metadata,
+                "target.layer": object(),
+            },
+            global_slot_mappings,
+        )
+    )
+
+    with patch.object(
+        speculator_module.AutoRegressiveSpeculator,
+        "_prefill",
+    ) as parent_prefill:
+        speculator._prefill(
+            num_reqs=2,
+            num_tokens=8,
+            attn_metadata={"local.layer": object()},
+            slot_mappings=MagicMock(),
+            num_tokens_across_dp=None,
+        )
+
+    speculator._prepare_replicated_prefill_attn.assert_called_once_with(
+        speculator.input_batch,
+        2,
+        8,
+    )
+    parent_prefill.assert_called_once()
+    parent_args = parent_prefill.call_args.args
+    assert parent_args[:2] == (2, 8)
+    assert parent_args[2] == {"draft.layer": draft_metadata}
+    assert parent_args[3] is global_slot_mappings
+
+
 @pytest.mark.parametrize(
     ("method", "speculator_cls", "parent_cls"),
     [

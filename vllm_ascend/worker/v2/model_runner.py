@@ -203,6 +203,39 @@ class NPUModelRunner(GPUModelRunner):
         return AscendPCPManager
 
     def sample_tokens(self, grammar_output):
+        # Restore rank-local target states immediately before the upstream
+        # sampling path consumes them as replicated draft inputs.
+        state = self.execute_model_state
+        pcp_manager = self.pcp_manager
+        if (
+            state is not None
+            and pcp_manager is not None
+            and self.is_last_pp_rank
+            and getattr(self.speculator, "replicated_pcp", False)
+        ):
+            # DeepSeek V4 MTP exposes its target state through a model-owned
+            # buffer instead of ExecuteModelState.
+            get_hidden_states = getattr(
+                self.model,
+                "get_mtp_target_hidden_states",
+                None,
+            )
+            mtp_target_hidden_states = (
+                get_hidden_states() if get_hidden_states is not None else None
+            )
+            if mtp_target_hidden_states is not None:
+                pcp_manager.restore_hidden_state_buffer(
+                    mtp_target_hidden_states
+                )
+            aux_hidden_states = state.aux_hidden_states
+            if aux_hidden_states:
+                restored_aux_hidden_states = pcp_manager.restore_hidden_states(
+                    torch.cat(aux_hidden_states, dim=-1)
+                )
+                self.execute_model_state = state._replace(
+                    aux_hidden_states=[restored_aux_hidden_states]
+                )
+
         output = super().sample_tokens(grammar_output)
 
         if self.use_spec_pp and self.is_last_pp_rank:
@@ -257,21 +290,6 @@ class NPUModelRunner(GPUModelRunner):
                 is_profile=is_profile,
                 context_len=context_len,
             )
-
-        state = self.execute_model_state
-        if state is not None and self.pcp_manager is not None:
-            get_hidden_states = getattr(
-                self.model,
-                "get_mtp_target_hidden_states",
-                None,
-            )
-            mtp_target_hidden_states = (
-                get_hidden_states() if get_hidden_states is not None else None
-            )
-            if mtp_target_hidden_states is not None:
-                self.pcp_manager.restore_hidden_state_buffer(
-                    mtp_target_hidden_states
-                )
 
         self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
             profiling_config,

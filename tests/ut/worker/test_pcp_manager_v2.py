@@ -675,27 +675,26 @@ def test_validate_config_allows_supported_speculators(method: str) -> None:
         num_speculative_tokens_per_batch_size=None,
         draft_sample_method="greedy",
     )
-    vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            prefill_context_parallel_size=2,
-            decode_context_parallel_size=1,
-        ),
-        model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(),
-        ),
-        speculative_config=speculative_config,
-        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
+    vllm_config = _make_pcp_config(
+        CUDAGraphMode.NONE,
+        sparse_mla=False,
     )
+    vllm_config.parallel_config.decode_context_parallel_size = 1
+    vllm_config.speculative_config = speculative_config
 
-    with patch.object(PCPManager, "validate_config") as parent_validate:
+    with patch.object(
+        vllm_model_runner.pcp.PCPManager,
+        "validate_config",
+        side_effect=AssertionError(
+            "Ascend validation must not delegate to the upstream implementation."
+        ),
+    ) as upstream_validate_config:
         AscendPCPManager.validate_config(
             vllm_config,
             supports_mm_inputs=False,
         )
 
-    validated_config = parent_validate.call_args.args[0]
-    assert validated_config is not vllm_config
-    assert validated_config.speculative_config is None
+    upstream_validate_config.assert_not_called()
     assert vllm_config.speculative_config is speculative_config
 
 

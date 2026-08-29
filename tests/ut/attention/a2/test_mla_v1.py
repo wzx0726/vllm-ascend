@@ -166,6 +166,7 @@ def test_mla_pcp_prefill_gathers_padded_cache_inputs() -> None:
     metadata.pcp_local_prefill_start = 3
     metadata.pcp_local_prefill_end = 5
     impl.pcp_enabled = True
+    impl.use_mla_rope = True
     impl.kv_a_layernorm = SimpleNamespace(
         weight=torch.empty(0),
         variance_epsilon=1e-6,
