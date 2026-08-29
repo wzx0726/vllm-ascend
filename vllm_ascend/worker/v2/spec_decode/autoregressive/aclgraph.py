@@ -134,7 +134,12 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
         else:
             logger.info_once("AutoRegressiveAclGraphManager: draft run_fullgraph with num_tokens=%s", num_tokens)
 
-        draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(desc.num_reqs, self.is_draft_model_prefill)
+        assert desc.num_reqs is not None
+        draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
+            desc.num_reqs,
+            self.is_draft_model_prefill,
+            num_tokens,
+        )
         self.update_stream.wait_stream(torch.npu.current_stream())
         ret = super().run_fullgraph(desc)
 

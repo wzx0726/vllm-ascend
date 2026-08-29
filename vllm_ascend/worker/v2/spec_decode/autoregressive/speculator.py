@@ -39,8 +39,14 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import AutoRegressiveSpeculator
 from vllm.v1.worker.utils import AttentionGroup
+
+from vllm_ascend.attention.attention_v1 import (
+    AscendAttentionBackend,
+    AscendAttentionState,
+)
 from vllm_ascend.attention.dsa_v1 import AscendDSABackend
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
+from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.sfa_v1 import AscendSFABackend
 from vllm_ascend.worker.v2.aclgraph_utils import _get_graph_update_backend
 from vllm_ascend.worker.v2.attn_utils import (
@@ -48,12 +54,6 @@ from vllm_ascend.worker.v2.attn_utils import (
     build_draft_attn_metadata_factory,
 )
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
-
-from vllm_ascend.attention.attention_v1 import (
-    AscendAttentionBackend,
-    AscendAttentionState,
-)
-from vllm_ascend.attention.mla_v1 import AscendMLABackend
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
@@ -113,7 +113,7 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         # when in decode phase of eagle speculator, we need some value in
         # draft model's input_batch. so we keep a reference here.
         self.input_batch: InputBatch | None = None
-        self.pcp_manager: "AscendPCPManager | None" = None
+        self.pcp_manager: AscendPCPManager | None = None
 
     @staticmethod
     def _create_draft_execution_config(
@@ -155,13 +155,13 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
     def _prepare_replicated_prefill_attn(
         self,
         input_batch: AscendInputBatch,
-        num_reqs: int,
+        num_reqs_padded: int,
         num_tokens_padded: int,
     ) -> tuple[dict[str, Any] | None, dict[str, torch.Tensor]]:
         """Build draft prefill metadata for the replicated global batch."""
         self.block_tables.gather_block_tables(
             input_batch.idx_mapping,
-            num_reqs_padded=num_reqs,
+            num_reqs_padded=num_reqs_padded,
         )
         slot_mappings_tensor = self.block_tables.compute_slot_mappings(
             input_batch.idx_mapping,
@@ -174,8 +174,8 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
             self.kv_cache_config,
         )
         attn_metadata = self._build_draft_attn_metadata(
-            num_reqs=num_reqs,
-            num_reqs_padded=num_reqs,
+            num_reqs=input_batch.num_reqs,
+            num_reqs_padded=num_reqs_padded,
             num_tokens_padded=num_tokens_padded,
             seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
             step=0,
@@ -195,7 +195,7 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         target_pcp_manager = getattr(self.model_state, "pcp_manager", None)
         # Target and draft share model_state, so validate the target manager
         # before temporarily detaching it for replicated PCP=1 execution.
-        if self.pcp_manager is None or target_pcp_manager is not self.pcp_manager:
+        if target_pcp_manager is not self.pcp_manager:
             raise RuntimeError(
                 "Replicated draft execution requires model_state to use the "
                 "target PCP manager."
@@ -501,9 +501,25 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
                 metadata.attn_state = AscendAttentionState.DecodeOnly
         return attn_metadata
 
-    def build_draft_attn_metadatas(self, num_reqs_padded, is_draft_model_prefill):
+    def build_draft_attn_metadatas(
+        self,
+        num_reqs_padded: int,
+        is_draft_model_prefill: bool,
+        num_tokens_padded: int,
+    ):
         """Build draft_attn_metadatas for partial-merged draft graph."""
-        attn_metadata = self.model_state.attn_metadata
+        if is_draft_model_prefill and self.replicated_pcp:
+            assert isinstance(self.input_batch, AscendInputBatch)
+            # FULL graph replay bypasses _prefill(). Rebuild here so the
+            # captured PCP=1 slot-mapping buffers and graph metadata describe
+            # the replicated global batch rather than the target PCP shard.
+            attn_metadata, _ = self._prepare_replicated_prefill_attn(
+                self.input_batch,
+                num_reqs_padded,
+                num_tokens_padded,
+            )
+        else:
+            attn_metadata = self.model_state.attn_metadata
         attn_metadata = {
             name: metadata for name, metadata in attn_metadata.items() if name in self.draft_attn_layer_names
         }
