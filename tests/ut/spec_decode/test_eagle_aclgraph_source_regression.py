@@ -38,7 +38,7 @@ def test_eagle_aclgraph_uses_verified_main_speculator_contract() -> None:
     assert "DecodeSpeculatorCudaGraphManager" not in source
 
 
-def test_draft_graph_passes_padded_shape_to_metadata_builder() -> None:
+def test_draft_graph_uses_current_metadata_builder_contract() -> None:
     tree = ast.parse(ACLGRAPH.read_text())
     run_fullgraph = _method(
         _class(tree, "AutoRegressiveAclGraphManager"),
@@ -56,7 +56,6 @@ def test_draft_graph_passes_padded_shape_to_metadata_builder() -> None:
     assert [ast.unparse(arg) for arg in calls[0].args] == [
         "desc.num_reqs",
         "self.is_draft_model_prefill",
-        "num_tokens",
     ]
 
 

@@ -81,12 +81,8 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         seq_lens_cpu from input_batch), so we replace input_buffers with
         AscendInputBuffers after super().__init__.
         """
-        self.replicated_pcp = (
-            vllm_config.parallel_config.prefill_context_parallel_size > 1
-        )
-        draft_execution_config = self._create_draft_execution_config(
-            vllm_config, self.replicated_pcp
-        )
+        self.replicated_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
+        draft_execution_config = self._create_draft_execution_config(vllm_config, self.replicated_pcp)
         super().__init__(draft_execution_config, device)
 
         self.attn_architecture: str | None = None
@@ -122,9 +118,7 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
     ) -> VllmConfig:
         """Build the draft config from its own parallel topology."""
         assert vllm_config.speculative_config is not None
-        draft_parallel_config = (
-            vllm_config.speculative_config.draft_parallel_config
-        )
+        draft_parallel_config = vllm_config.speculative_config.draft_parallel_config
         if replicated_pcp:
             draft_parallel_config = replace(
                 draft_parallel_config,
@@ -196,10 +190,7 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         # Target and draft share model_state, so validate the target manager
         # before temporarily detaching it for replicated PCP=1 execution.
         if target_pcp_manager is not self.pcp_manager:
-            raise RuntimeError(
-                "Replicated draft execution requires model_state to use the "
-                "target PCP manager."
-            )
+            raise RuntimeError("Replicated draft execution requires model_state to use the target PCP manager.")
 
         self.model_state.pcp_manager = None
         try:
@@ -386,9 +377,7 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         # also contain target-only attention layers (e.g. GDN layers).
         if attn_metadata is not None and self.draft_attn_layer_names is not None:
             attn_metadata = {
-                name: metadata
-                for name, metadata in attn_metadata.items()
-                if name in self.draft_attn_layer_names
+                name: metadata for name, metadata in attn_metadata.items() if name in self.draft_attn_layer_names
             }
         super()._prefill(
             num_reqs,
@@ -505,21 +494,9 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         self,
         num_reqs_padded: int,
         is_draft_model_prefill: bool,
-        num_tokens_padded: int,
     ):
         """Build draft_attn_metadatas for partial-merged draft graph."""
-        if is_draft_model_prefill and self.replicated_pcp:
-            assert isinstance(self.input_batch, AscendInputBatch)
-            # FULL graph replay bypasses _prefill(). Rebuild here so the
-            # captured PCP=1 slot-mapping buffers and graph metadata describe
-            # the replicated global batch rather than the target PCP shard.
-            attn_metadata, _ = self._prepare_replicated_prefill_attn(
-                self.input_batch,
-                num_reqs_padded,
-                num_tokens_padded,
-            )
-        else:
-            attn_metadata = self.model_state.attn_metadata
+        attn_metadata = self.model_state.attn_metadata
         attn_metadata = {
             name: metadata for name, metadata in attn_metadata.items() if name in self.draft_attn_layer_names
         }
