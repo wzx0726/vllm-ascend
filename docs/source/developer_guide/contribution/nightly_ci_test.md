@@ -206,6 +206,19 @@ The `pr-accuracy-group-*` entries only run on `/nightly` (PR-triggered) runs;
     A3 will queue a large number of jobs — prefer targeting specific test names when
     possible.
 
+### A3-560T workflow (`.github/workflows/schedule_nightly_test_a3_560t.yaml`)
+
+MRV2 PCP+DCP accuracy tests use the existing YAML-driven single-node runner:
+
+| Test name | Matrix section | Description |
+|-----------|----------------|-------------|
+| `mrv2-pcp-dcp-mla` | `a3-560t.single_node.test_config` | DeepSeek-R1-0528-W8A8, TP8 + PCP2 + DCP16 + MTP |
+| `mrv2-pcp-dcp-gqa` | `a3-560t.multi_card.test_config` | Qwen3-32B QuaRot, TP2 + PCP2 + DCP2 + Eagle3 |
+
+```text
+/nightly mrv2-pcp-dcp-mla mrv2-pcp-dcp-gqa --a3-560t
+```
+
 ## Examples
 
 Run all available nightly tests against your PR:

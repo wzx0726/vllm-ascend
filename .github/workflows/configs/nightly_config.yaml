@@ -226,6 +226,10 @@ a3-560t:
         os: linux-aarch64-a3-800i-16
         config_file_path: DeepSeek-R1-0528-W8A8.yaml
         config_base_path: tests/e2e/cases/models/configs/DeepSeek
+      - name: mrv2-pcp-dcp-mla
+        os: linux-aarch64-a3-800i-16
+        config_file_path: DeepSeek-R1-0528-W8A8-MRV2-PCP-DCP.yaml
+        config_base_path: tests/e2e/cases/models/configs/DeepSeek
       - name: Deepseek_R1_W8A8_A3
         os: linux-aarch64-a3-800i-16
         config_file_path: Deepseek_R1_W8A8_A3.yaml
@@ -316,6 +320,10 @@ a3-560t:
       - name: Qwen3-32B-QuaRot
         os: linux-aarch64-a3-800i-2
         config_file_path: Qwen3-32B-QuaRot-eagle3.yaml
+        config_base_path: tests/e2e/cases/models/configs/Qwen
+      - name: mrv2-pcp-dcp-gqa
+        os: linux-aarch64-a3-800i-4
+        config_file_path: Qwen3-32B-QuaRot-eagle3-MRV2-PCP-DCP.yaml
         config_base_path: tests/e2e/cases/models/configs/Qwen
 310p:
   single_node:
