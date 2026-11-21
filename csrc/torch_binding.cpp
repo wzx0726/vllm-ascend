@@ -20,6 +20,7 @@
 #include <torch/version.h>
 #include <torch/torch.h>
 #include <ATen/core/Formatting.h>
+#include <c10/core/InferenceMode.h>
 #include "acl/acl.h"
 #include "acl/acl_rt.h"
 #include <torch_npu/csrc/core/npu/NPUStream.h>
@@ -80,6 +81,66 @@
 #include <vector>
 
 namespace vllm_ascend {
+
+#ifndef ASCEND_PLATFORM_310P
+// Only compare ordinary dense metadata. No tensor dispatch or device memory read
+// is needed to establish equivalence of these one-byte E8M0 input views.
+static bool is_plain_mxfp4_scale(const at::Tensor& tensor)
+{
+    static constexpr c10::DispatchKeySet allowed{
+        c10::DispatchKey::CPU, c10::DispatchKey::PrivateUse1, c10::DispatchKey::ADInplaceOrView,
+        c10::DispatchKey::AutogradCPU, c10::DispatchKey::AutogradPrivateUse1,
+        c10::DispatchKey::AutocastCPU, c10::DispatchKey::AutocastPrivateUse1};
+    return tensor.defined() && allowed.isSupersetOf(tensor.key_set()) &&
+        (tensor.is_cpu() || tensor.is_privateuseone()) &&
+        !tensor.unsafeGetTensorImpl()->has_symbolic_sizes_strides() &&
+        tensor.layout() == at::kStrided && tensor.has_storage() &&
+        !tensor.has_names() && !tensor.requires_grad() && tensor.is_contiguous() &&
+        (tensor.scalar_type() == at::kByte || tensor.scalar_type() == at::ScalarType::Float8_e8m0fnu);
+}
+
+static bool mxfp4_scale_group_matches(at::TensorList current, at::TensorList views, c10::Device device)
+{
+    for (size_t i = 0; i < current.size(); ++i) {
+        const auto& value = current[i];
+        const auto& view = views[i];
+        if (!is_plain_mxfp4_scale(value) || !is_plain_mxfp4_scale(view) ||
+            value.device() != device || view.device() != device ||
+            view.scalar_type() != at::ScalarType::Float8_e8m0fnu ||
+            view.is_inference() != c10::InferenceMode::is_enabled() ||
+            value.storage().unsafeGetStorageImpl() != view.storage().unsafeGetStorageImpl() ||
+            value.storage_offset() != view.storage_offset() ||
+            value.sizes() != view.sizes() || value.strides() != view.strides()) {
+            return false;
+        }
+        // NPU format lives on this shared StorageImpl. Inspect its existing
+        // host descriptor using the same base-format helper as the ACL adapter.
+        if (!::IsOpInputBaseFormat(value)) {
+            return false;
+        }
+        const auto storage_bytes = value.storage().sym_nbytes().maybe_as_int();
+        const int64_t elements = value.numel();
+        const int64_t offset = value.storage_offset();
+        if (!storage_bytes || *storage_bytes < 0 || elements <= 0 || offset < 0 ||
+            offset > *storage_bytes || elements > *storage_bytes - offset) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool mxfp4_scale_views_match(at::TensorList current1, at::TensorList current2,
+                                    at::TensorList views1, at::TensorList views2)
+{
+    if (current1.empty() || current1.size() != current2.size() || current1.size() != views1.size() ||
+        current2.size() != views2.size() || !is_plain_mxfp4_scale(current1.front())) {
+        return false;
+    }
+    const auto device = current1.front().device();
+    return mxfp4_scale_group_matches(current1, views1, device) &&
+           mxfp4_scale_group_matches(current2, views2, device);
+}
+#endif
 
 c10::optional<at::Tensor> get_npu_view_from_cpu_tensor(const at::Tensor& cpu_tensor)
 {
@@ -2868,6 +2929,16 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.def("get_physical_device_id(int user_device_id) -> int");
     ops.impl("get_physical_device_id", c10::DispatchKey::CompositeExplicitAutograd,
              &vllm_ascend::get_physical_device_id);
+
+    ops.def("_mxfp4_scale_views_match(Tensor[] current1, Tensor[] current2, Tensor[] views1, Tensor[] views2) -> bool");
+    ops.impl("_mxfp4_scale_views_match", c10::DispatchKey::CompositeExplicitAutograd,
+             &vllm_ascend::mxfp4_scale_views_match);
+    // The default wrappers can materialize lazy values before the predicate.
+    // Inspect their original key sets instead and let the old getter handle them.
+    for (auto key : {c10::DispatchKey::Negative, c10::DispatchKey::Conjugate, c10::DispatchKey::ZeroTensor,
+                     c10::DispatchKey::Functionalize, c10::DispatchKey::Named}) {
+        ops.impl("_mxfp4_scale_views_match", key, torch::CppFunction::makeFallthrough());
+    }
 
     // vLLM-Ascend custom ops
     // Gemma RmsNorm

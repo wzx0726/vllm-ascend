@@ -641,7 +641,10 @@ class FusedMC2CommImpl(MoECommMethod):
         quant_method=None,
     ):
         if quant_method is not None:
-            weights = quant_method.get_fused_mc2_weights(fused_experts_input.layer)
+            get_weights = quant_method.get_fused_mc2_weights
+            if self.enable_fused_mc2 == 1 and _EXTRA_CTX.use_mega_moe:
+                get_weights = getattr(quant_method, "_get_cann_mega_moe_weights", get_weights)
+            weights = get_weights(fused_experts_input.layer)
         else:
             # Backward-compatible fallback for legacy callers that still build
             # the weight payload through build_fused_experts_input.

@@ -78,7 +78,8 @@ def pcp_gather_tokens(hidden_states: torch.Tensor, pcp_size: int, layer_name: st
         # Profiling may omit the recurrent metadata. Keep the gathered extent.
         return gathered
     output = gathered.index_select(0, metadata.pcp_restore_idx)
-    return output.masked_fill(~metadata.pcp_restore_mask[:, None], 0)
+    # index_select owns fresh storage, so masking here cannot change gathered.
+    return output.masked_fill_(~metadata.pcp_restore_mask[:, None], 0)
 
 
 def pcp_gather_tokens_fake(hidden_states: torch.Tensor, pcp_size: int, layer_name: str) -> torch.Tensor:
@@ -91,7 +92,9 @@ def pcp_scatter_tokens(output: torch.Tensor, pcp_size: int, layer_name: str) -> 
     if metadata is None:
         return output[: output.shape[0] // pcp_size].clone()
     local_output = output.index_select(0, metadata.pcp_local_idx)
-    return local_output.masked_fill(~metadata.pcp_local_mask[:, None], 0)
+    # Only the freshly selected rows are mutated, preserving the custom op's
+    # no-input-mutation contract.
+    return local_output.masked_fill_(~metadata.pcp_local_mask[:, None], 0)
 
 
 def pcp_scatter_tokens_fake(output: torch.Tensor, pcp_size: int, layer_name: str) -> torch.Tensor:

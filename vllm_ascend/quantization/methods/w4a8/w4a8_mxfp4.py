@@ -17,10 +17,11 @@
 
 
 from typing import Any
+from weakref import WeakKeyDictionary
 
 import torch
 import torch_npu
-from vllm.config import get_current_vllm_config
+from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -47,6 +48,11 @@ from ..registry import register_scheme
 
 # CANN uses 36 to select FP8 E4M3FN output for situ_mx_quant.
 SITU_MX_DST_TYPE_E4M3FN = 36
+
+# Each layer owns an independent cache lifetime. Concurrent readers validate their
+# local snapshot before use; replacing the entry never mutates an in-flight list.
+# The weak keys keep these private views out of the model's serialized state.
+_MEGAMOE_SCALE_VIEWS = WeakKeyDictionary()
 
 
 @register_scheme("W4A8_MXFP", "linear")
@@ -175,6 +181,11 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         vllm_config = get_current_vllm_config()
         self.group_size = vllm_config.quant_config.quant_description.get("group_size", 32)
         ascend_config = get_ascend_config()
+        self._eager_scale_view_reuse = (
+            vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+            and isinstance(vllm_config.additional_config, dict)
+            and vllm_config.additional_config.get("megamoe_checked_scale_views") is True
+        )
         self.dynamic_eplb = False if vllm_config.use_v2_model_runner else ascend_config.eplb_config.dynamic_eplb
         self.use_expert_weight_list = self.dynamic_eplb or (
             vllm_config.use_v2_model_runner is True and vllm_config.parallel_config.enable_eplb is True
@@ -238,6 +249,70 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             ),
             quant_method=self,
         )
+
+    def _get_cann_mega_moe_weights(self, layer: torch.nn.Module) -> MoEWeights:
+        """Reuse dedicated scale aliases only for the read-only eager MegaMoe consumer."""
+        if torch.compiler.is_compiling() or torch.jit.is_tracing():
+            return self.get_fused_mc2_weights(layer)
+        if (
+            type(self) not in (AscendW4A8MXFPDynamicFusedMoEMethod, AscendW4A8MXFPDSDynamicFusedMoEMethod)
+            or not self.use_expert_weight_list
+            or not _EXTRA_CTX.use_mega_moe
+            or "get_fused_mc2_weights" in vars(self)
+            or not getattr(self, "_eager_scale_view_reuse", False)
+            or not torch.is_inference_mode_enabled()
+            or getattr(layer, "ascend_megamoe_shared_fusion", None) is not None
+        ):
+            return self.get_fused_mc2_weights(layer)
+
+        matches = getattr(torch.ops._C_ascend, "_mxfp4_scale_views_match", None)
+        capture = getattr(getattr(torch, "npu", None), "is_current_stream_capturing", None)
+        function_mode = getattr(torch._C, "_is_torch_function_mode_enabled", None)
+        dispatch_depth = getattr(torch._C, "_len_torch_dispatch_stack", None)
+        transforms = getattr(torch._C, "_are_functorch_transforms_active", None)
+        if matches is None or capture is None or function_mode is None or dispatch_depth is None or transforms is None:
+            return self.get_fused_mc2_weights(layer)
+        if function_mode() or dispatch_depth() or transforms() or capture():
+            return self.get_fused_mc2_weights(layer)
+        first, second = layer.w13_weight_scale_list, layer.w2_weight_scale_list
+        if type(layer).__hash__ is not object.__hash__ or type(layer).__eq__ is not object.__eq__:
+            return self.get_fused_mc2_weights(layer)
+        if (
+            type(first) is not list
+            or type(second) is not list
+            or any(type(t) is not torch.Tensor for group in (first, second) for t in group)
+        ):
+            _MEGAMOE_SCALE_VIEWS.pop(layer, None)
+            return self.get_fused_mc2_weights(layer)
+
+        def still_matches(views):
+            try:
+                return matches(first, second, *views)
+            except torch.OutOfMemoryError:
+                raise
+            except RuntimeError:
+                # A backend without this metadata-only guard for an input
+                # must defer dtype-view semantics to the original getter.
+                return False
+
+        cached = _MEGAMOE_SCALE_VIEWS.get(layer)
+        if cached is not None and still_matches(cached):
+            return MoEWeights(
+                w1=layer.w13_weight_list,
+                w2=layer.w2_weight_list,
+                w1_scale=list(cached[0]),
+                w2_scale=list(cached[1]),
+            )
+
+        if cached is not None:
+            # Release a retired set even if the original getter below fails.
+            _MEGAMOE_SCALE_VIEWS.pop(layer, None)
+            del cached
+        weights = self.get_fused_mc2_weights(layer)
+        views = (weights.w1_scale, weights.w2_scale)
+        if still_matches(views):
+            _MEGAMOE_SCALE_VIEWS[layer] = tuple(views[0]), tuple(views[1])
+        return weights
 
     def get_fused_mc2_weights(self, layer: torch.nn.Module) -> MoEWeights:
         if self.use_expert_weight_list:

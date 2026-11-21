@@ -1,0 +1,6 @@
+pr: 3
+entries:
+  - category: bugfix
+    text: Fixed a Qwen4Exp startup failure caused by allocating the PLE embedding table twice when both data and prefill context parallelism are enabled.
+  - category: config
+    text: Added the opt-in megamoe_checked_scale_views setting in additional_config to reuse validated MXFP4 expert scale views during eager MegaMoe inference. Shared-expert fusion continues to use the existing weight path.
